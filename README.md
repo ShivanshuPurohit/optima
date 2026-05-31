@@ -22,7 +22,8 @@ per-token **KL** against a reference run, and **task accuracy** on real benchmar
 **Done & validated on a real GPU (H100, sglang 0.5.9):** the whole *mechanism* —
 typed op-slots, the seam that swaps an untrusted kernel into a spawned model
 process, op-correctness, two-launch throughput measurement, the KL gate, a
-benchmark (GSM8K) capability gate, commit-reveal + king-of-the-hill scoring, and
+real-task capability gate (GSM8K + MMLU), commit-reveal + king-of-the-hill
+scoring, and
 tamper-resistant timing. Two slots exist (`activation.silu_and_mul`,
 `norm.rmsnorm`), proven on models from Qwen2.5-0.5B up to **gpt-oss-120b**.
 
@@ -78,6 +79,18 @@ caught a *subtle* real drift a per-op check missed.
 3. **For a quantized model there's no fp32 ground truth** (gpt-oss is MXFP4), so the
    KL reference is the stock-kernel run; the threshold must tolerate benign
    rounding in either direction.
+4. **Big MoE models need per-launch process isolation + deterministic scoring.**
+   The two launches must each run in their **own process** (`call_in_subprocess`):
+   on gpt-oss-120b in deterministic mode, running baseline then candidate in one
+   driver process corrupted the candidate (NaN outputs → a *no-op* kernel "regressed"
+   to 0%). With isolation, deterministic mode works and the stock-vs-stock KL floor
+   is **~0** (a clean gate — validated: a no-op scores KL `0.0`, PASS). In
+   **non-deterministic** mode the floor on the realistic long-generation workload is
+   **1.17e-2** — *above* a 5e-3 gate — so a faithful kernel false-fails. Takeaway:
+   **score big MoE in deterministic mode**; where that's unavailable, run
+   `--kl-advisory` and let the **accuracy gate** carry quality. (KL is also now
+   hardened: a genuinely degenerate candidate — all-non-finite logprobs — reads as
+   maximal divergence, not 0.)
 
 ## Repo layout
 
@@ -95,9 +108,9 @@ optima/
     sglang_norm.py          # patch RMSNorm
     sglang_plugin.py        # entry point for sglang builds that have a plugin fw
   eval/
-    throughput_kl.py        # two-launch throughput + KL
-    capability.py           # two-launch throughput + benchmark accuracy gate
-    benchmarks.py           # Benchmark protocol + GSM8K (HF), answer extraction
+    throughput_kl.py        # two-launch throughput + KL (generic corpus; calibration smoke)
+    capability.py           # two-launch throughput + KL + benchmark accuracy (the real-task scoring path)
+    benchmarks.py           # Benchmark protocol + GSM8K & MMLU (HF), answer extraction
     kl.py / prompts.py / _launch.py
   bundle_hash.py            # deterministic bundle identity
   commit_reveal.py          # commit-reveal + king-of-the-hill ledger
@@ -153,15 +166,20 @@ export TORCH_CUDA_ARCH_LIST=9.0                        # 9.0=H100, 12.0=RTX Blac
 # op-correctness on device
 .venv/bin/python -m optima.cli verify examples/miner_rmsnorm_triton --device cuda
 
-# end-to-end gates (run via `python -m optima.cli` for spawn-safety)
+# cheap KL smoke on a generic corpus (calibration / quick check)
 .venv/bin/python -m optima.cli evaluate examples/miner_silu_triton \
     --model Qwen/Qwen2.5-0.5B-Instruct --no-deterministic            # KL gate
-.venv/bin/python -m optima.cli bench examples/miner_silu_triton \
-    --model Qwen/Qwen2.5-1.5B-Instruct --benchmarks gsm8k --samples 64  # benchmark gate
 
-# big model needs more memory headroom:
+# the real scoring path: throughput on real benchmark prompts (GSM8K + MMLU, long
+# CoT generation), gated on KL *and* task accuracy from the same run
+.venv/bin/python -m optima.cli bench examples/miner_silu_triton \
+    --model Qwen/Qwen2.5-1.5B-Instruct --benchmarks gsm8k,mmlu --samples 64
+
+# gpt-oss-120b TP=4 on Blackwell (sm_120a): plain-triton MoE, custom-allreduce off
 .venv/bin/python -m optima.cli bench examples/miner_rmsnorm_broken \
-    --model openai/gpt-oss-120b --benchmarks gsm8k --mem-fraction 0.9   # must FAIL
+    --model openai/gpt-oss-120b --benchmarks gsm8k,mmlu --samples 16 \
+    --tp-size 4 --moe-runner-backend triton --disable-custom-all-reduce \
+    --mem-fraction 0.85   # must FAIL (accuracy collapse and/or KL blowup)
 ```
 
 ## The submission ABI
@@ -223,7 +241,7 @@ cross-validator consensus catches a rogue validator.
 | Slots | silu, rmsnorm (toy kernels) | + attention/MLA, MoE, GEMM (real wins) |
 | Throughput gain | **none yet** | the actual point — real faster kernels |
 | Model | up to gpt-oss-120b (1 GPU) | DSV4-scale (multi-GPU, TP/PD/EP) |
-| Quality gate | KL + GSM8K, **uncalibrated** | noise-floor KL + large-n benchmarks + det mode |
+| Quality gate | KL + GSM8K/MMLU on real prompts, **uncalibrated** | noise-floor KL + large-n benchmarks + det mode |
 | Isolation | scan + in-proc load | namespaces + no-egress + per-eval ctx + watchdog |
 | Chain | local JSON ledger | on-chain commit-reveal + set_weights |
 | State | JSON | a real DB, single-writer weights |

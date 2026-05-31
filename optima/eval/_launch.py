@@ -26,6 +26,34 @@ def env(**overrides: str):
                 os.environ[k] = v
 
 
+def engine_kwargs(cfg) -> dict[str, Any]:
+    """Translate an ``EvalConfig`` into ``sglang.Engine`` kwargs.
+
+    Shared by both eval paths so multi-GPU knobs (``tp_size`` / ``moe_runner_backend``
+    / ``disable_custom_all_reduce``) and deterministic mode apply identically. New
+    fields are read with ``getattr`` so an older/duck-typed cfg still works.
+    """
+    kwargs: dict[str, Any] = dict(
+        model_path=cfg.model_path,
+        dtype=cfg.dtype,
+        attention_backend=cfg.attention_backend,
+        disable_cuda_graph=cfg.disable_cuda_graph,
+        mem_fraction_static=cfg.mem_fraction_static,
+        random_seed=cfg.seed,
+        log_level=cfg.log_level,
+    )
+    if getattr(cfg, "deterministic", False):
+        kwargs["enable_deterministic_inference"] = True
+    if getattr(cfg, "tp_size", None):
+        kwargs["tp_size"] = int(cfg.tp_size)
+    if getattr(cfg, "moe_runner_backend", None):
+        kwargs["moe_runner_backend"] = cfg.moe_runner_backend
+    if getattr(cfg, "disable_custom_all_reduce", False):
+        kwargs["disable_custom_all_reduce"] = True
+    kwargs.update(getattr(cfg, "extra_engine_kwargs", {}) or {})
+    return kwargs
+
+
 @contextmanager
 def launched_engine(cfg, *, bundle_path: str, active: bool):
     """Launch a sglang Engine with the Optima seam configured.
@@ -44,19 +72,7 @@ def launched_engine(cfg, *, bundle_path: str, active: bool):
     ):
         import sglang as sgl
 
-        kwargs: dict[str, Any] = dict(
-            model_path=cfg.model_path,
-            dtype=cfg.dtype,
-            attention_backend=cfg.attention_backend,
-            disable_cuda_graph=cfg.disable_cuda_graph,
-            mem_fraction_static=cfg.mem_fraction_static,
-            random_seed=cfg.seed,
-            log_level=cfg.log_level,
-        )
-        if cfg.deterministic:
-            kwargs["enable_deterministic_inference"] = True
-        kwargs.update(cfg.extra_engine_kwargs)
-        engine = sgl.Engine(**kwargs)
+        engine = sgl.Engine(**engine_kwargs(cfg))
         try:
             yield engine
         finally:
@@ -64,3 +80,59 @@ def launched_engine(cfg, *, bundle_path: str, active: bool):
                 engine.shutdown()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def _subprocess_entry(out_path, fn, args, kwargs):
+    """Run ``fn(*args, **kwargs)`` and pickle the result (or traceback) to a file."""
+    import pickle
+    import traceback
+
+    try:
+        payload = {"value": fn(*args, **kwargs), "error": None}
+    except BaseException:  # noqa: BLE001 - report ANY failure back to the parent
+        payload = {"value": None, "error": traceback.format_exc()}
+    with open(out_path, "wb") as f:
+        pickle.dump(payload, f)
+
+
+def call_in_subprocess(fn, *args, **kwargs):
+    """Run ``fn(*args, **kwargs)`` in a FRESH spawned process; return its result.
+
+    Each model launch must run in its own process. sglang + deterministic mode set
+    process-global state (torch deterministic algorithms, the cuBLAS workspace, the
+    sampling backend) and hold a CUDA context; a second launch in the same driver
+    process inherits that state and — observed on gpt-oss-120b in deterministic mode —
+    the candidate launch then produces NaN/garbage. A fresh process makes the baseline
+    and candidate launches independent and frees all GPU/host memory between them.
+
+    ``fn`` must be a module-level (picklable) callable; the result travels back through
+    a temp pickle file (avoids mp.Queue size limits / pipe deadlocks on large logprob
+    payloads). Raises ``RuntimeError`` if the child crashes or ``fn`` raises.
+    """
+    import multiprocessing as mp
+    import os
+    import pickle
+    import tempfile
+
+    ctx = mp.get_context("spawn")
+    fd, path = tempfile.mkstemp(prefix="optima_launch_", suffix=".pkl")
+    os.close(fd)
+    try:
+        proc = ctx.Process(target=_subprocess_entry, args=(path, fn, args, kwargs))
+        proc.start()
+        proc.join()
+        try:
+            with open(path, "rb") as f:
+                payload = pickle.load(f)
+        except (EOFError, FileNotFoundError, pickle.UnpicklingError) as exc:
+            raise RuntimeError(
+                f"launch subprocess crashed (exitcode={proc.exitcode}) with no result: {exc}"
+            ) from None
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if payload.get("error"):
+        raise RuntimeError("launch subprocess failed:\n" + payload["error"])
+    return payload["value"]
