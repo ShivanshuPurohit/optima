@@ -1,0 +1,282 @@
+# How a real subnet is built — lessons from Affine, applied to Optima
+
+I studied [AffineFoundation/affine-cortex](https://github.com/AffineFoundation/affine-cortex)
+(a live Bittensor subnet) to learn the *scaffolding* a production subnet needs —
+the chain plumbing, the service decomposition, the state/DB layer, deployment —
+independent of its specific incentive (Affine evaluates submitted **models** on RL
+tasks; Optima evaluates submitted **kernels** for throughput).
+
+The headline: **Affine's incentive mechanism is almost identical to the one we
+designed.** That's strong independent validation. What we're missing is the
+operational machinery around it. This doc captures both.
+
+---
+
+## 1. Our incentive design is validated
+
+Side by side:
+
+| Concept | Affine | Optima (what we built) |
+|---|---|---|
+| Miners submit | `(HF model, revision)` committed on chain | a kernel bundle (commit-reveal) |
+| Validator runs the compute | yes (Targon / B300 fleet hosts inference) | yes (our validator runs the model) |
+| Champion / challenger | yes | yes (`Ledger.settle`) |
+| Dethrone rule | win **strictly across all envs** by a per-env **margin** | beat champion by **speedup margin** |
+| Reward | **winner-take-all** to champion (+ burn) | `weights = {champion: 1.0}` |
+| Anti-copy | behavioral fingerprint, earliest-committer-wins | content-hash, earliest-commit-wins |
+| Anti-overfit | refresh task pool every ~24h, re-sample champion | per-epoch prompt sampling |
+| Fairness | judge both on the **same task_ids** in the same window | judge both on the **same prompts** |
+
+We got the mechanism right. Affine adds four refinements worth adopting (§7).
+
+---
+
+## 2. The thing we were missing: a subnet is a *fleet of services around a DB*
+
+Our harness is one CLI. A production subnet is **6-ish cooperating services that
+coordinate through a database**, with the chain used only as the trust anchor.
+Affine's decomposition (`affine/src/*`):
+
+| Service | Job | Touches chain? |
+|---|---|---|
+| **validator** | the *only* thing that sets weights on chain; reads computed weights from the DB/API and emits them every ~180 blocks | **yes — weights** |
+| **monitor** | syncs the metagraph + reads on-chain miner commitments; seeds the challenger queue; flips `is_valid` | **yes — reads** |
+| **scheduler** | the king-of-the-hill engine: block-tick loop that picks a challenger, runs the battle, decides, updates the champion | no |
+| **executor** | runs the actual evaluations (process pool, one per env), writes results to the DB | no |
+| **anticopy** (refresh + worker) | builds the champion's rollout fingerprints, teacher-forces challengers, computes copy verdicts | no |
+| **api** | read-only FastAPI (rank / scores / miners) — the dashboard backend | no |
+
+Key architectural principle: **no message brokers.** Everything coordinates
+through the DB. State is *implicit* — the scheduler/executor infer what to do from
+"what rows are missing," so the system is restart-safe (re-derive, don't replay).
+
+### Optima's production architecture (the target)
+
+```
+            ┌──────── Bittensor chain ────────┐
+            │  miner commitments  │  weights   │
+            └─────────▲───────────┴─────▲──────┘
+                      │ read              │ write
+   ┌──────────┐   ┌───┴─────┐        ┌────┴──────┐
+   │ monitor  │──►│   DB    │◄───────│ validator │   (thin; sets weights/180 blk)
+   │ (chain   │   │ (state) │        └───────────┘
+   │  sync,   │   └──▲───┬──┘
+   │  queue)  │      │   │
+   └──────────┘   ┌──┴───▼────┐   ┌────────────┐   ┌─────────┐
+                  │ scheduler │──►│  executor  │──►│ GPU box │  (runs miner kernels
+                  │ (king of  │   │ (evaluate: │   │ sglang  │   in isolation)
+                  │  the hill)│   │  thru+KL)  │   └─────────┘
+                  └───────────┘   └────────────┘
+                        │
+                  ┌─────▼─────┐
+                  │    api    │  (leaderboard / dashboard)
+                  └───────────┘
+```
+
+Our current code maps cleanly onto this: `commit_reveal.Ledger` → the **DB + the
+king-of-the-hill part of the scheduler**; `eval.throughput_kl.evaluate` → the
+**executor**; `cli.py` → the seams of all of them. What's new is the **chain
+plumbing (monitor + validator)**, a **real DB**, and the **service split**.
+
+---
+
+## 3. Chain plumbing — the concrete Bittensor calls
+
+Affine's pattern (`affine/utils/subtensor.py`, `affine/core/miners.py`,
+`affine/src/validator/weight_setter.py`). Verify exact signatures against your
+`bittensor` version, but the shape is:
+
+```python
+import bittensor as bt
+
+# connect (async SDK), with a primary + fallback endpoint
+st = bt.AsyncSubtensor("finney")          # or a wss:// URL
+await st.initialize()
+
+# metagraph: UID <-> hotkey
+meta = await st.metagraph(netuid)
+hotkey = meta.hotkeys[uid]
+
+# read miner commitments  (the bundle reference miners put on chain)
+commits = await st.get_all_revealed_commitments(netuid)
+#   -> { hotkey: [(block, json_str), ...] }
+block, payload = commits[hotkey][-1]
+ref = json.loads(payload)                 # e.g. {"bundle_hash": ..., "url": ...}
+
+# block cadence for weight setting (epoch-aligned)
+blk = await st.get_current_block()
+await st.wait_for_block(blk + 1)
+
+# set weights (winner-take-all to champion)
+await st.set_weights(wallet=wallet, netuid=netuid,
+                     uids=uids, weights=weights,
+                     wait_for_inclusion=True, wait_for_finalization=True)
+
+# wallet
+wallet = bt.Wallet(name=BT_WALLET_COLD, hotkey=BT_WALLET_HOT)
+```
+
+Miner side: commit on chain with `set_reveal_commitment(wallet, netuid,
+data=json_str, blocks_until_reveal=1)`.
+
+### The big realization: **Bittensor gives you commit-reveal for free**
+
+We built `commit_reveal.py` from scratch. We don't need the *transport* — the
+chain has native commit-reveal (`set_reveal_commitment` /
+`get_all_revealed_commitments`). So the design simplifies:
+
+- **Miner** commits a small JSON on chain: the **bundle hash + a URL** to fetch the
+  bundle from (content-addressed store / R2 / HF). The chain timestamps it
+  (`first_block`) — that's our anti-copy priority for free.
+- **Validator** reads commitments, fetches bundles, evaluates.
+- Our `commit_reveal.py` keeps only the **off-chain half**: copy detection +
+  king-of-the-hill `settle`. The commit/reveal *binding* moves to the chain.
+
+Affine uses **plain `set_weights`** (no commit-reveal weights, no `version_key`),
+emitted every ~180 blocks, epoch-aligned. Winner gets 1.0, a configurable **burn
+fraction** goes to UID 0.
+
+---
+
+## 4. State lives in a DB, not on the chain
+
+The chain holds only **commitments** (miner → bundle ref) and **weights**.
+Everything else — scores, the champion, per-miner status, snapshots, the queue —
+lives in a database. Affine uses **DynamoDB**; the table shapes generalize:
+
+| Table | Holds |
+|---|---|
+| `miners` | uid, hotkey, bundle ref, `is_valid`, `challenge_status` |
+| `sample_results` | raw per-eval outputs, keyed by `(miner, env, task_id, refresh_block)` |
+| `scores` | per-window aggregate score per miner |
+| `score_snapshots` | one row per settle: block, outcome, final weights (audit) |
+| `system_config` | operator-tunable settings + runtime state (champion, task pool) |
+
+For Optima, our JSON `Ledger` is the toy version of `miners` + `scores` +
+`system_config`. Production swaps it for Postgres/DynamoDB with the same shapes.
+**Single-writer pattern**: exactly one service writes the scores/weights tables
+(Affine's `weight_writer`); everyone else reads. Prevents races.
+
+---
+
+## 5. Miners submit a *reference*, the validator runs the compute
+
+Affine miners never run inference hardware — they commit `(model, revision)` and
+the **validator hosts the inference** (Targon, a GPU broker, or an
+operator-managed B300 fleet). This is exactly Optima's principle ("miners don't
+submit hardware"). **Your 8×B200 ask is literally Affine's "operator-managed
+fleet."** Affine even runs sglang on the GPU boxes — same stack as us.
+
+Provider abstraction is worth copying: the scheduler dispatches evals to either a
+broker (Targon) or your own fleet (SSH to bare-metal), behind one interface
+(`inference_endpoints` table). Start on a broker/rented box, move to owned B200s
+when funded — no code change.
+
+---
+
+## 6. Copy detection: exact hashes aren't enough — fingerprint *behavior*
+
+This is the most important technical lesson for us. Our copy detection is an
+**exact content hash** — perfect for byte-identical resubmissions. But Affine
+fingerprints **behavior**, because a copy is rarely byte-identical:
+
+- For models, Affine compares **sparse logprobs on "decision positions"** — only
+  the tokens where the model was *uncertain* (reference logprob below a cutoff).
+  Trivial tokens (everyone agrees, lp≈0) are excluded; divergence shows on the
+  hard tokens. Copy iff the **median |Δlogp|** across those positions is below a
+  threshold (0.05). Plus a **tokenizer signature** (SHA256 over vocab+merges) to
+  group comparable models, and a **lookback window** (7d) to avoid cross-season
+  false positives. Earliest committer wins.
+
+**Why this matters for Optima:** a kernel "copy" that renames variables, reorders
+lines, or tweaks a constant has a **different content hash but identical
+behavior**. Exact-hash copy detection misses it. We need a **functional
+fingerprint** alongside the source hash — e.g., hash the kernel's **outputs on a
+fixed canonical input set** (and/or a normalized-AST hash). Two kernels with the
+same output fingerprint within tolerance, where one committed earlier, → the later
+is a copy. This is a concrete next-step for `commit_reveal.py` /
+`bundle_hash.py`.
+
+(Affine's behavioral approach is heavy — separate worker, R2 storage, async
+verdict backfill — because their submissions are giant models. Ours is lighter: a
+kernel's output fingerprint is cheap to compute during the eval we already run.)
+
+---
+
+## 7. Four mechanism refinements to adopt from Affine
+
+1. **Re-sample the champion when the task pool refreshes.** When prompts rotate,
+   the champion's old score is on old prompts and isn't comparable to a challenger
+   scored on new prompts. Affine re-scores the champion on the new pool before the
+   queue continues. We must too (today our champion score is frozen at crowning).
+2. **Permanently terminate a losing submission.** Affine never re-evaluates a
+   challenger that lost (it's terminated; the queue advances). For us: terminate
+   per **content/output hash** — a miner can submit a *new, improved* kernel (new
+   hash), but the same losing kernel is never re-run. Bounds eval cost and spam.
+3. **Overlap-based fairness + oversampling.** Judge champion and challenger on the
+   **exact same** task set in the same window; oversample ~10% and abandon the long
+   tail so the comparison set is always fully covered.
+4. **Burn fraction.** A configurable share of emission to UID 0 — a lever for
+   emission control / quality floor.
+
+---
+
+## 8. The security pattern that solves our isolation problem
+
+Affine's anticopy worker uses an **SSH-tunnel isolation** pattern that is exactly
+what Optima needs for running untrusted kernels:
+
+> Secrets (chain keys, cloud/R2 credentials) live **only on a CPU control box**.
+> The **GPU box** runs only sglang and **never sees any secrets**. The CPU box
+> drives the GPU box over an SSH tunnel.
+
+Map this onto our threat model (HOW_OPTIMA_WORKS Part 8.4): the GPU box is where
+the **untrusted miner kernel executes**. If that box holds no chain keys, no cloud
+creds, and has **no network egress** except the SSH control channel, then even a
+fully malicious kernel that achieves code execution:
+
+- can't steal the validator's chain/cloud keys (they're not there),
+- can't exfiltrate over the network (no egress),
+- can be wiped between evals (ephemeral GPU box).
+
+Combine with a per-eval CUDA context + watchdog (for GPU DoS / OOB writes) and you
+have a real isolation boundary. **This is the concrete shape of the isolation
+layer we said we still need to build** — and Affine is already running it.
+
+---
+
+## 9. Operational patterns worth stealing
+
+- **Primary + fallback subtensor endpoints**, auto-reconnect on failure.
+- **Watchdog / watchtower** auto-restart of every service.
+- **Warmup delay after deploy** before sampling (containers report "ready" too
+  early; we already hit this — JIT warmup).
+- **Single-writer** for the scores/weights tables.
+- **Process-local API cache** (TTL ~10min) so dashboard request rate doesn't
+  hammer the DB.
+- **Deterministic, seeded sampling** keyed by `(window, block, env)` so restarts
+  reproduce the same task set.
+
+---
+
+## 10. What this changes in Optima's roadmap
+
+Concretely, to go from "validated harness" to "shippable subnet":
+
+1. **Chain layer** (`optima/chain/`): subtensor connect (+fallback), read
+   commitments, sync metagraph, set weights every N blocks. Miner-side commit
+   helper. (Use Bittensor's native commit-reveal; drop our custom transport.)
+2. **Real DB** behind the `Ledger` interface (Postgres to start): `miners`,
+   `scores`, `snapshots`, `system_config`. Single-writer weights.
+3. **Service split**: `monitor` (chain→DB), `scheduler` (king-of-the-hill driver
+   over blocks, with champion re-sample on refresh + loser termination),
+   `executor` (our `evaluate`, as a pool), `validator` (thin weight-setter),
+   `api` (leaderboard).
+4. **Functional copy fingerprint** (kernel output hash on canonical inputs) added
+   to copy detection.
+5. **Isolation**: SSH-control-box / no-secrets-GPU-box / no-egress + per-eval CUDA
+   context + watchdog.
+6. **Provider abstraction**: rented box now, owned 8×B200 later, one interface.
+
+The incentive core is done and validated. The above is the productionization, and
+Affine is a working reference implementation for every piece of it.

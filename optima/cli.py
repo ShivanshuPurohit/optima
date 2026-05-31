@@ -1,0 +1,391 @@
+"""Optima validator CLI — drives the submission pipeline end to end.
+
+    python -m optima.cli slots
+    python -m optima.cli scan      <bundle>
+    python -m optima.cli verify    <bundle> [--dtype bfloat16] [--device cuda]
+    python -m optima.cli evaluate  <bundle> --model <path> [--max-new-tokens 128]
+
+Pipeline (mirrors the validator flow):
+
+    manifest -> static scan -> (isolated) load -> op-correctness -> register
+             -> build engine -> baseline vs candidate -> throughput + KL -> score
+
+SECURITY NOTE: ``verify`` and ``evaluate`` import the miner module, which runs
+its code in THIS process. That is only acceptable because the whole validator
+host is expected to be the sandbox (no network, per-eval GPU context, watchdog).
+Do not run this on a machine you care about without that isolation. See
+``optima/sandbox.py``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+from optima.manifest import load_manifest, resolve_source
+from optima.sandbox import load_entry, scan_path
+from optima.slots import SLOTS, get_slot, list_slots
+
+
+def _dtype(name: str):
+    import torch
+
+    return {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[name]
+
+
+def cmd_slots(_: argparse.Namespace) -> int:
+    print("Registered op-slots (the submission ABI):")
+    for name in list_slots():
+        spec = SLOTS[name]
+        print(f"  {name}")
+        print(f"      entry({', '.join(spec.in_names)}, out) -> None")
+        print(f"      {spec.summary}")
+    return 0
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    m = load_manifest(args.bundle)
+    print(f"bundle: {m.bundle_id}  abi: {m.abi_version}  ops: {len(m.ops)}")
+    rc = 0
+    for op in m.ops:
+        src = resolve_source(args.bundle, op)
+        result = scan_path(src)
+        status = "clean" if result.ok else "VIOLATIONS"
+        print(f"  [{status}] {op.slot} <- {op.source}")
+        for v in result.violations:
+            print(f"      {v}")
+            rc = 2
+    return rc
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    from optima.verify import format_verify, verify_entry
+
+    m = load_manifest(args.bundle)
+    rc = 0
+    for op in m.ops:
+        if op.slot not in SLOTS:
+            print(f"  [SKIP] {op.slot}: not a known slot on this validator")
+            continue
+        slot = get_slot(op.slot)
+        src = resolve_source(args.bundle, op)
+
+        scan = scan_path(src)
+        if not scan.ok:
+            print(f"  [FAIL] {op.slot}: failed policy scan")
+            for v in scan.violations:
+                print(f"      {v}")
+            rc = 2
+            continue
+
+        entry = load_entry(src, op.entry)  # SECURITY: isolate in production
+        result = verify_entry(
+            slot, entry, dtype=_dtype(args.dtype), device=args.device, seed=args.seed
+        )
+        print(format_verify(result))
+        if not result.passed:
+            rc = 2
+    return rc
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    from optima.eval.throughput_kl import EvalConfig, evaluate
+
+    # Trusted parent: validate + scan only. It never imports miner code — the
+    # kernel is loaded inside the (to-be-isolated) model process by the plugin.
+    m = load_manifest(args.bundle)
+    known = 0
+    for op in m.ops:
+        if op.slot not in SLOTS:
+            print(f"  [skip] {op.slot}: unknown slot")
+            continue
+        src = resolve_source(args.bundle, op)
+        scan = scan_path(src)
+        if not scan.ok:
+            print(f"  [FAIL] {op.slot}: failed policy scan; aborting")
+            for v in scan.violations:
+                print(f"      {v}")
+            return 2
+        known += 1
+        print(f"  [ok]   {op.slot} <- {op.source} ({op.entry}) [scan clean]")
+
+    if known == 0:
+        print("no known slots in this bundle; nothing to evaluate")
+        return 1
+
+    cfg = EvalConfig(
+        model_path=args.model,
+        dtype=args.dtype,
+        max_new_tokens=args.max_new_tokens,
+        num_prompts=args.num_prompts,
+        timed_iters=args.timed_iters,
+        prompt_seed=args.prompt_seed,
+        top_logprobs_num=args.top_logprobs,
+        kl_threshold=args.kl_threshold,
+        deterministic=not args.no_deterministic,
+        mem_fraction_static=args.mem_fraction,
+    )
+    print(f"\nrunning two launches of {args.model} (dtype={args.dtype}, "
+          f"deterministic={cfg.deterministic}): baseline then candidate ...")
+    report = evaluate(cfg, str(args.bundle))
+
+    b, c = report.baseline, report.candidate
+    bmin, bmax, bsd = b.spread
+    cmin, cmax, csd = c.spread
+    print("\n=== Optima end-to-end report ===")
+    print(f"bundle: {m.bundle_id}")
+    print(f"baseline   {b.tok_per_s:8.1f} tok/s  (median of {len(b.tok_per_s_samples)}; "
+          f"range {bmin:.0f}-{bmax:.0f}, sd {bsd:.1f})")
+    print(f"candidate  {c.tok_per_s:8.1f} tok/s  (median of {len(c.tok_per_s_samples)}; "
+          f"range {cmin:.0f}-{cmax:.0f}, sd {csd:.1f})")
+    print(f"speedup    {report.speedup:8.3f}x  (needs >= {1 + cfg.speedup_margin:.2f} -> "
+          f"{'PASS' if report.passed_speedup else 'below margin'})")
+    print(f"quality    mean_kl={report.kl.mean_kl:.3e} max_kl={report.kl.max_kl:.3e} "
+          f"argmax_disagree={report.kl.argmax_disagreements}/{report.kl.num_positions} -> "
+          f"{'PASS' if report.passed_quality else 'FAIL'}")
+    print(f"SCORE      {report.score:.3f}")
+
+    if getattr(args, "ledger", None) and getattr(args, "hotkey", None):
+        from optima.bundle_hash import content_hash
+        from optima.commit_reveal import Ledger
+
+        ch = content_hash(args.bundle)
+        led = Ledger.load(args.ledger)
+        led.record_score(args.hotkey, ch, args.round, report.score, report.kl.mean_kl, report.passed_quality)
+        led.save(args.ledger)
+        print(f"recorded -> {args.ledger} (hotkey={args.hotkey}, round={args.round})")
+    return 0 if report.passed_quality else 3
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    from optima.eval.capability import evaluate_capability
+    from optima.eval.throughput_kl import EvalConfig
+
+    m = load_manifest(args.bundle)
+    known = 0
+    for op in m.ops:
+        if op.slot not in SLOTS:
+            continue
+        src = resolve_source(args.bundle, op)
+        scan = scan_path(src)
+        if not scan.ok:
+            print(f"  [FAIL] {op.slot}: failed policy scan; aborting")
+            for v in scan.violations:
+                print(f"      {v}")
+            return 2
+        known += 1
+    if known == 0:
+        print("no known slots in this bundle; nothing to evaluate")
+        return 1
+
+    cfg = EvalConfig(
+        model_path=args.model,
+        dtype=args.dtype,
+        timed_iters=args.timed_iters,
+        prompt_seed=args.prompt_seed,
+        deterministic=not args.no_deterministic,
+        mem_fraction_static=args.mem_fraction,
+    )
+    names = [b.strip() for b in args.benchmarks.split(",") if b.strip()]
+    print(f"\nbenchmark eval of {args.model} on {names} "
+          f"({args.samples}/bench): baseline then candidate ...")
+    report = evaluate_capability(
+        cfg, str(args.bundle), names,
+        samples_per_benchmark=args.samples, acc_tolerance=args.acc_tolerance,
+    )
+
+    print("\n=== Optima capability report ===")
+    print(f"bundle: {m.bundle_id}")
+    for bs in report.benchmarks:
+        flag = "" if bs.delta >= -args.acc_tolerance else "  <-- REGRESSION"
+        print(f"  {bs.name:10s} baseline {bs.baseline_acc:6.1%} ({bs.baseline_correct}/{bs.n})  "
+              f"candidate {bs.candidate_acc:6.1%} ({bs.candidate_correct}/{bs.n})  "
+              f"Δ{bs.delta:+.1%}{flag}")
+    print(f"throughput baseline {report.baseline_tok_s:8.1f} tok/s  candidate {report.candidate_tok_s:8.1f} tok/s")
+    print(f"speedup    {report.speedup:8.3f}x  -> {'PASS' if report.passed_speedup else 'below margin'}")
+    print(f"quality    no-accuracy-regression -> {'PASS' if report.passed_quality else 'FAIL'}")
+    print(f"SCORE      {report.score:.3f}")
+
+    if getattr(args, "ledger", None) and getattr(args, "hotkey", None):
+        from optima.bundle_hash import content_hash
+        from optima.commit_reveal import Ledger
+
+        ch = content_hash(args.bundle)
+        led = Ledger.load(args.ledger)
+        # use mean candidate accuracy as the kl_mean stand-in for the record
+        mean_acc = (sum(b.candidate_acc for b in report.benchmarks) / len(report.benchmarks)
+                    if report.benchmarks else 0.0)
+        led.record_score(args.hotkey, ch, args.round, report.score, mean_acc, report.passed_quality)
+        led.save(args.ledger)
+        print(f"recorded -> {args.ledger} (hotkey={args.hotkey}, round={args.round})")
+    return 0 if report.passed_quality else 3
+
+
+def cmd_hash(args: argparse.Namespace) -> int:
+    from optima.bundle_hash import content_hash
+
+    print(content_hash(args.bundle))
+    return 0
+
+
+def cmd_commit(args: argparse.Namespace) -> int:
+    from optima.bundle_hash import content_hash
+    from optima.commit_reveal import Ledger, make_commitment
+
+    ch = content_hash(args.bundle)
+    com = make_commitment(ch, args.hotkey, args.salt)
+    led = Ledger.load(args.ledger)
+    seq = led.commit(args.hotkey, com, args.round)
+    led.save(args.ledger)
+    print(f"committed hotkey={args.hotkey} round={args.round} seq={seq}")
+    print(f"commitment={com}")
+    print("keep your --salt and bundle; you'll need both to reveal")
+    return 0
+
+
+def cmd_reveal(args: argparse.Namespace) -> int:
+    from optima.bundle_hash import content_hash
+    from optima.commit_reveal import Ledger, RevealError
+
+    ch = content_hash(args.bundle)
+    led = Ledger.load(args.ledger)
+    try:
+        rev = led.reveal(args.hotkey, ch, args.salt, args.round)
+    except RevealError as e:
+        print(f"REJECTED: {e}")
+        return 2
+    led.save(args.ledger)
+    print(f"revealed hotkey={args.hotkey} content={ch[:16]}... original={rev.original}")
+    if not rev.original:
+        print("  -> flagged as a COPY (an earlier commitment to this content exists); earns 0")
+    return 0
+
+
+def cmd_ledger(args: argparse.Namespace) -> int:
+    from optima.commit_reveal import Ledger
+
+    led = Ledger.load(args.ledger)
+    print(f"commitments={len(led.commitments)} reveals={len(led.reveals)} scores={len(led.scores)}")
+    if led.champion:
+        c = led.champion
+        print(f"champion: hotkey={c.hotkey} score={c.score:.3f} round={c.round_id} "
+              f"content={c.content_hash[:16]}...")
+    else:
+        print("champion: (none yet)")
+    return 0
+
+
+def cmd_settle(args: argparse.Namespace) -> int:
+    from optima.commit_reveal import Ledger
+
+    led = Ledger.load(args.ledger)
+    res = led.settle(args.round, margin=args.margin)
+    led.save(args.ledger)
+    print(f"title_changed={res.title_changed} challenger_score={res.challenger_score:.3f}")
+    if res.champion:
+        print(f"champion: {res.champion.hotkey} score={res.champion.score:.3f}")
+    if res.rejected_copies:
+        print(f"rejected copies: {', '.join(res.rejected_copies)}")
+    print(f"weights: {res.weights}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="optima", description="Optima validator harness")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("slots", help="list the op-slot ABI")
+    sp.set_defaults(func=cmd_slots)
+
+    sp = sub.add_parser("scan", help="static policy scan of a bundle")
+    sp.add_argument("bundle")
+    sp.set_defaults(func=cmd_scan)
+
+    sp = sub.add_parser("verify", help="op-level correctness vs reference")
+    sp.add_argument("bundle")
+    sp.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    sp.add_argument("--device", default=None, help="cuda|cpu (default: auto)")
+    sp.add_argument("--seed", type=int, default=0)
+    sp.set_defaults(func=cmd_verify)
+
+    sp = sub.add_parser("evaluate", help="end-to-end throughput + KL on a model")
+    sp.add_argument("bundle")
+    sp.add_argument("--model", required=True, help="model path for sglang.Engine")
+    sp.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    sp.add_argument("--max-new-tokens", type=int, default=64)
+    sp.add_argument("--num-prompts", type=int, default=32)
+    sp.add_argument("--timed-iters", type=int, default=3, help="median-of-K timed passes per launch")
+    sp.add_argument("--prompt-seed", type=int, default=0, help="per-epoch prompt sampling seed")
+    sp.add_argument("--top-logprobs", type=int, default=20)
+    sp.add_argument("--kl-threshold", type=float, default=5e-3)
+    sp.add_argument("--mem-fraction", type=float, default=0.6,
+                    help="sglang mem_fraction_static (use ~0.9 for big models like gpt-oss-120b)")
+    sp.add_argument("--no-deterministic", action="store_true")
+    # optional: record the result into a commit-reveal ledger
+    sp.add_argument("--ledger", default=None, help="ledger json to record the score into")
+    sp.add_argument("--hotkey", default=None, help="miner hotkey (with --ledger)")
+    sp.add_argument("--round", type=int, default=0, help="round id (with --ledger)")
+    sp.set_defaults(func=cmd_evaluate)
+
+    sp = sub.add_parser("bench", help="benchmark-based eval: throughput gated by task accuracy")
+    sp.add_argument("bundle")
+    sp.add_argument("--model", required=True)
+    sp.add_argument("--benchmarks", default="gsm8k", help="comma-separated benchmark names")
+    sp.add_argument("--samples", type=int, default=32, help="problems per benchmark")
+    sp.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    sp.add_argument("--timed-iters", type=int, default=2)
+    sp.add_argument("--prompt-seed", type=int, default=0)
+    sp.add_argument("--acc-tolerance", type=float, default=0.02)
+    sp.add_argument("--mem-fraction", type=float, default=0.6,
+                    help="sglang mem_fraction_static (use ~0.9 for big models like gpt-oss-120b)")
+    sp.add_argument("--no-deterministic", action="store_true")
+    sp.add_argument("--ledger", default=None)
+    sp.add_argument("--hotkey", default=None)
+    sp.add_argument("--round", type=int, default=0)
+    sp.set_defaults(func=cmd_bench)
+
+    # ---- commit-reveal / scoring ledger ----
+    sp = sub.add_parser("hash", help="print a bundle's deterministic content hash")
+    sp.add_argument("bundle")
+    sp.set_defaults(func=cmd_hash)
+
+    sp = sub.add_parser("commit", help="post a commitment for a bundle (commit phase)")
+    sp.add_argument("bundle")
+    sp.add_argument("--hotkey", required=True)
+    sp.add_argument("--salt", required=True)
+    sp.add_argument("--round", type=int, default=0)
+    sp.add_argument("--ledger", default="optima_ledger.json")
+    sp.set_defaults(func=cmd_commit)
+
+    sp = sub.add_parser("reveal", help="reveal a previously committed bundle (reveal phase)")
+    sp.add_argument("bundle")
+    sp.add_argument("--hotkey", required=True)
+    sp.add_argument("--salt", required=True)
+    sp.add_argument("--round", type=int, default=0)
+    sp.add_argument("--ledger", default="optima_ledger.json")
+    sp.set_defaults(func=cmd_reveal)
+
+    sp = sub.add_parser("ledger", help="show ledger state (champion, counts)")
+    sp.add_argument("--ledger", default="optima_ledger.json")
+    sp.set_defaults(func=cmd_ledger)
+
+    sp = sub.add_parser("settle", help="settle a round: king-of-the-hill + weights")
+    sp.add_argument("--round", type=int, default=0)
+    sp.add_argument("--margin", type=float, default=0.02)
+    sp.add_argument("--ledger", default="optima_ledger.json")
+    sp.set_defaults(func=cmd_settle)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

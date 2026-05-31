@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "optima-harness"
+version = "0.0.1"
+description = "Validator harness for an inference-throughput competition on SGLang"
+requires-python = ">=3.10"
+# torch is required but intentionally NOT pinned here: install the build that
+# matches the validator's CUDA/SGLang environment first, then `pip install -e .`.
+dependencies = []
+
+[project.optional-dependencies]
+# `toml` is only needed on Python < 3.11 (3.11+ has tomllib in the stdlib).
+legacy-toml = ["toml>=0.10"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+optima = "optima.cli:main"
+
+# Installs the Optima seam inside every SGLang process (incl. the spawned
+# scheduler that runs the model). This is validator-owned code. Select it with
+# SGLANG_PLUGINS=optima (the eval harness sets this automatically).
+[project.entry-points."sglang.srt.plugins"]
+optima = "optima.integrations.sglang_plugin:register"
+
+[tool.setuptools.packages.find]
+include = ["optima*"]
+exclude = ["sglang*", "examples*", "tests*"]
