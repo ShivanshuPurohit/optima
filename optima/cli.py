@@ -24,7 +24,6 @@ import sys
 
 from optima.manifest import load_manifest, resolve_source
 from optima.sandbox import load_entry, scan_path
-from optima.slots import SLOTS, get_slot, list_slots
 
 
 def _dtype(name: str):
@@ -38,11 +37,12 @@ def _dtype(name: str):
 
 
 def cmd_slots(_: argparse.Namespace) -> int:
+    from optima.slots import SLOTS, list_slots
+
     print("Registered op-slots (the submission ABI):")
     for name in list_slots():
         spec = SLOTS[name]
         print(f"  {name}")
-        print(f"      entry({', '.join(spec.in_names)}, out) -> None")
         print(f"      {spec.summary}")
     return 0
 
@@ -72,6 +72,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
+    from optima.slots import SLOTS, get_slot
     from optima.verify import format_verify, verify_entry
 
     m = load_manifest(args.bundle)
@@ -102,6 +103,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
+    from optima.slots import SLOTS
     from optima.eval.throughput_kl import EvalConfig, evaluate
 
     # Trusted parent: validate + scan only. It never imports miner code — the
@@ -171,6 +173,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 
 
 def cmd_bench(args: argparse.Namespace) -> int:
+    from optima.slots import SLOTS
     from optima.eval.capability import evaluate_capability
     from optima.eval.throughput_kl import EvalConfig
 

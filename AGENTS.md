@@ -1,7 +1,7 @@
 # Optima — agent onboarding
 
-> This file is auto-loaded by Claude Code when working in this repo. Read it
-> first. It is the orientation; the deep docs are under `docs/`.
+> This file is the quick orientation for any coding agent working in this repo.
+> Read it first; the deep docs are under `docs/`.
 
 ## What this is
 
@@ -42,7 +42,8 @@ This repo is the **validator harness** (the referee), plus example miner bundles
 - **Open:** isolation for untrusted miners, chain integration, a real DB, bigger
   slots (attention/MLA, MoE), and **eval calibration** (KL threshold = k× the
   measured nondeterminism noise floor; run with `enable_deterministic_inference`;
-  benchmark accuracy needs large n).
+  benchmark accuracy needs large n). RMSNorm was chosen as the second slot because
+  it is simple and universal, not because it is expected to be a major speed win.
 
 ## How to run
 
@@ -71,6 +72,9 @@ matters — sglang uses `mp spawn`).
 - Adding a slot = a `SlotSpec` in `optima/slots.py` + a seam patch in
   `optima/integrations/` (installed from `seam.activate()`, module added to
   `bootstrap._TARGETS`).
+- Miner submissions are Triton/CuteDSL source, not raw CUDA extensions. That
+  narrows the attack surface and keeps submissions inspectable, but the host
+  Python launch code still runs in-process, so isolation remains required.
 - Don't claim a kernel "drifts" without measuring the **stock-vs-stock KL noise
   floor** first (we got burned on this).
 - **sglang is pinned** (`PINNED_SGLANG` in `optima/compat.py`) — all validators
@@ -80,6 +84,6 @@ matters — sglang uses `mp spawn`).
 
 ## Persistence note for future agents
 
-This repo's `CLAUDE.md`/`AGENTS.md` + `docs/` are the canonical context (they
-travel with the repo). Auto-memory is a per-cwd supplement. Keep README + this
-file current when state changes. Consider `git init` here if not already.
+This repo's `AGENTS.md`, the `CLAUDE.md` shim, and `docs/` are the canonical
+context (they travel with the repo). Auto-memory is a per-cwd supplement. Keep
+README + this file current when state changes.

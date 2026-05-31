@@ -9,11 +9,12 @@ description = "Validator harness for an inference-throughput competition on SGLa
 requires-python = ">=3.10"
 # torch is required but intentionally NOT pinned here: install the build that
 # matches the validator's CUDA/SGLang environment first, then `pip install -e .`.
-dependencies = []
+dependencies = [
+  # Python 3.11+ has tomllib in the stdlib; 3.10 needs the same parser API.
+  "tomli>=2; python_version<'3.11'",
+]
 
 [project.optional-dependencies]
-# `toml` is only needed on Python < 3.11 (3.11+ has tomllib in the stdlib).
-legacy-toml = ["toml>=0.10"]
 dev = ["pytest>=7"]
 
 [project.scripts]

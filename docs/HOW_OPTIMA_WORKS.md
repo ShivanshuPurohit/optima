@@ -153,18 +153,19 @@ targets and *where* the kernel source lives. It does not run anything yet.
 ### 3.2 The op-slot ABI — the contract
 
 The set of operations a miner is allowed to replace is the **op-slot catalog**,
-owned by the validator in [../optima/slots.py](../optima/slots.py). Today there is
-one slot, `activation.silu_and_mul`. A slot (`SlotSpec`) declares everything the
-validator needs to *use* and *verify* a kernel without trusting it:
+owned by the validator in [../optima/slots.py](../optima/slots.py). Today there
+are two slots, `activation.silu_and_mul` and `norm.rmsnorm`. A slot (`SlotSpec`)
+declares everything the validator needs to *use* and *verify* a kernel without
+trusting it:
 
 ```python
 SlotSpec(
     name="activation.silu_and_mul",
     entry="silu_and_mul",        # the function the miner module must expose
-    in_names=("x",),             # positional inputs to entry, in order
-    reference=_silu_and_mul_reference,   # the trusted ground-truth implementation
     make_inputs=_silu_and_mul_inputs,    # deterministic test-input generator
     out_shape=_silu_and_mul_out_shape,   # how to size the output
+    invoke_reference=lambda i: ...,      # trusted ground-truth implementation
+    invoke_entry=lambda entry, i, out: ...,  # slot-specific call contract
     shapes=( ... ),              # the shapes correctness is checked on
     tolerances={ bf16: (2e-2, 2e-2), ... },
 )

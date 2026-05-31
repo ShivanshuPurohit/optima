@@ -1,0 +1,26 @@
+name: sglang canary
+
+# Weekly: is there a newer sglang, and do our seams still hold? Activates once
+# this repo is pushed to GitHub. A failing run (newer release and/or red seam
+# canary) surfaces on the Actions tab and emails the repo owner.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Mondays 09:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install harness (no GPU deps)
+        run: pip install -e .
+      - name: Best-effort install sglang (CPU runner may not build sgl-kernel)
+        run: pip install sglang || echo "sglang not installable on CPU runner — the PyPI release check still runs"
+        continue-on-error: true
+      - name: Run the canary
+        run: python scripts/check_sglang.py

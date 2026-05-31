@@ -61,9 +61,27 @@ the baseline rises and the subnet must keep finding new wins) or stays **private
 stack* is the product; you track sglang as the moving base and your stack sits on
 top.
 
-## Automation (optional, recommended)
+## Automation (set up)
 
-Turn "stay current" into a notification instead of a chore: a weekly scheduled job
-(cron / GitHub Action / Claude `schedule`) that checks for a new sglang release,
-installs it in a scratch venv, runs `optima compat`, and pings you if it's red or a
-new release exists. Then a human decides whether to run the bump process.
+Turn "stay current" into a notification instead of a chore. Two pieces ship in the
+repo:
+
+- **`scripts/check_sglang.py`** — checks PyPI for a newer sglang vs `PINNED_SGLANG`
+  (pure HTTP, runs anywhere) and, if sglang is importable, runs the seam canary.
+  Exit 1 = attention needed. Run it anywhere: `python scripts/check_sglang.py`.
+- **`.github/workflows/sglang-canary.yml`** — a weekly GitHub Action (Mondays
+  09:00 UTC) that runs the script. **Activates once this repo is on GitHub**; a
+  failing run (new release and/or red canary) shows on the Actions tab and emails
+  the owner. This is the home for the automation — and it fits the plan to make the
+  repo public.
+
+Until the repo is on GitHub, run it locally (e.g. cron on an always-on box):
+
+```
+0 9 * * 1  cd /path/to/optima && .venv/bin/python scripts/check_sglang.py
+```
+
+Note: the *seam* canary needs sglang importable (best on a GPU/pod venv); the
+*release* check works everywhere. On a CPU CI runner sglang may not build, so the
+Action reliably catches new releases and the full seam check runs on the pod as
+part of the bump process.
