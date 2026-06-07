@@ -92,7 +92,7 @@ def cmd_set_weights(args: argparse.Namespace) -> int:
         return 0
     import bittensor as bt
 
-    wallet = bt.wallet(name=args.wallet, hotkey=args.hotkey)
+    wallet = bt.Wallet(name=args.wallet, hotkey=args.hotkey)
     res = chain.set_weights(subtensor, wallet, args.netuid, weights)
     print(f"set_weights submitted={res.get('submitted')} uids={res.get('uids')}")
     return 0 if res.get("submitted") else 1

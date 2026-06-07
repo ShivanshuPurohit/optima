@@ -60,15 +60,17 @@ def run_checks() -> list[Check]:
     ver = getattr(bt, "__version__", "?")
     add("bittensor installed", True, f"version {ver}")
 
-    # Wallet class (we sign extrinsics + set weights with a wallet).
-    wallet_cls = getattr(bt, "wallet", None) or getattr(bt, "Wallet", None)
-    add("wallet class present", wallet_cls is not None,
-        "bt.wallet / bt.Wallet — signs extrinsics")
+    # Wallet class (we sign extrinsics + set weights with a wallet). Prefer the
+    # capitalized `Wallet` (the live class); `wallet` is a deprecated lowercase alias.
+    wallet_cls = getattr(bt, "Wallet", None) or getattr(bt, "wallet", None)
+    add("Wallet class present", wallet_cls is not None,
+        "bt.Wallet — signs extrinsics")
 
-    # The chain client class.
-    subtensor_cls = getattr(bt, "subtensor", None) or getattr(bt, "Subtensor", None)
-    add("subtensor class present", subtensor_cls is not None,
-        "bt.subtensor / bt.Subtensor — the chain client")
+    # The chain client class. Prefer the capitalized `Subtensor` (the live class in
+    # current bittensor); `subtensor` is a deprecated lowercase alias.
+    subtensor_cls = getattr(bt, "Subtensor", None) or getattr(bt, "subtensor", None)
+    add("Subtensor class present", subtensor_cls is not None,
+        "bt.Subtensor — the chain client")
     if subtensor_cls is None:
         return checks
 

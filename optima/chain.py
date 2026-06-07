@@ -87,7 +87,7 @@ def connect(network: str = "finney"):
     """Open a subtensor client. ``network='test'`` for the public testnet."""
     import bittensor as bt
 
-    return bt.subtensor(network=network)
+    return bt.Subtensor(network=network)
 
 
 def _block_hash(subtensor, block: int) -> str:
