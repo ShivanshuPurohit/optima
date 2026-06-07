@@ -9,8 +9,8 @@ per-token **KL** against a reference run, and **task accuracy** on real benchmar
 > full end-to-end explainer: what the validator does, what miners submit, the
 > exact pipeline, how a kernel gets into the model, and the complete threat model
 > (including the "fake the output via an API call" attack and why the op-slot
-> design defeats it). *(Some of its prose predates the current 7-slot catalog and
-> the first throughput win — this README is the current state of record.)*
+> design defeats it). *(Some of its prose predates the current slot catalog —
+> this README is the current state of record.)*
 >
 > **Going to production?** [docs/SUBNET_BLUEPRINT.md](docs/SUBNET_BLUEPRINT.md)
 > distills how a real Bittensor subnet (Affine) is built — chain plumbing, the
@@ -25,27 +25,23 @@ slot** (a slot can be one op, a region behind one typed tensor boundary, or a co
 handed the process group), the seam that swaps an untrusted kernel into a spawned model
 process, op-correctness, two-launch throughput measurement, the KL gate, a real-task
 capability gate (GSM8K + MMLU), commit-reveal + king-of-the-hill scoring, and
-tamper-resistant timing. **Seven slots:** `activation.silu_and_mul`, `norm.rmsnorm` (ops);
-`attention.sdpa` / `attention.decode`, `moe.fused_experts` / `moe.fused_experts_mxfp4`
-(blocks); `collective.all_reduce` (collective, verified distributed). The
-**attention-decode swap is proven end-to-end on a live Qwen** (the validator extracts the
-running model's paged KV and routes decode to the miner kernel; a broken kernel is caught
-~20×), and scoring runs with **CUDA graphs ON + the hardware's best attention backend**,
-never a graphs-off/triton weak baseline.
+tamper-resistant timing. **Six slots:** `activation.silu_and_mul`, `norm.rmsnorm` (ops);
+`attention.sdpa` / `attention.decode`, `moe.fused_experts` (blocks); `collective.all_reduce`
+(collective, verified distributed). The **attention-decode swap is proven end-to-end on a
+live Qwen** (the validator extracts the running model's paged KV and routes decode to the
+miner kernel; a broken kernel is caught ~20×), and scoring runs with **CUDA graphs ON + the
+hardware's best attention backend**, never a graphs-off/triton weak baseline.
 
-**First throughput win — through SlotSpec, no fork.** On 4× RTX PRO 6000 Blackwell (sm120)
-the `moe.fused_experts_mxfp4` bundle routes gpt-oss-120b's experts through the
-`FusedMoE.forward` seam at **~912–922 tok/s (TP=4, batch 32)** — matching the hand-forked
-`flashinfer_mxfp4` backend (~926) while the validator runs **stock pinned sglang**, and
-**+19% over the stock-realizable path** (stock sglang is forced onto the triton MoE fallback
-on sm120). Be honest about what it is: a *route-to-a-faster-existing-path-via-the-seam* win
-on a frontier where stock has only a slow fallback — **not** a novel hand-written kernel
-beating a mature tuned baseline (that's still open). The silu/rmsnorm/attention demos remain
-toy/slow; they prove the contract — the MXFP4 MoE is the first speed win.
+**No kernel has beaten sglang — the optimization side is unproven.** This validates the
+*referee*, not any optimization. Every example kernel is a correctness demo: faithful ones
+reproduce the model and are *slower* than sglang's own tuned kernels; broken ones are caught
+by the gate. The point so far is that the harness can tell a real kernel from a cheat and
+time it tamper-resistantly — not that any submission moves throughput.
 
-**Still open:** a novel kernel beating stock on a mature path, isolation for untrusted
-miners, chain integration, a real DB, the next arena (**B200/sm100**, where sglang's FP4 MoE
-genuinely works and is tuned), and **eval calibration** (see "Calibration findings").
+**Still open — including the actual goal:** a submitted kernel that genuinely beats sglang at
+equal fidelity. Plus isolation for untrusted miners, chain integration, a real DB, bigger
+slots (MLA / weight-absorbed attention, GEMM, comms-overlap blocks), and **eval calibration**
+(see "Calibration findings").
 
 ## Status: validated end-to-end
 
@@ -63,7 +59,7 @@ degrade the model; the gate must reject them.
 The cheat is genuinely 26% faster yet scores **zero** because it can't do the
 work anymore. *Fast-but-dumb = worthless.*
 
-**gpt-oss-120b (MXFP4, single H100), GSM8K + KL:**
+**gpt-oss-120b (single H100), GSM8K + KL:**
 
 | Bundle | GSM8K base→cand | KL | gate |
 |---|---|---|---|
@@ -74,36 +70,10 @@ work anymore. *Fast-but-dumb = worthless.*
 **3.9e-4** (1/2041 token flips). The faithful kernel's **9.2e-3 / 24-flips is ~24×
 the floor**, so it's *real* drift, not sampling noise: this toy kernel isn't
 bit-faithful to sglang's RMSNorm, and the **end-to-end gate correctly caught what
-op-correctness (bf16 tolerance) passed**. Wins here: the RMSNorm seam **fires on a
+op-correctness (bf16 tolerance) passed**. What this validates: the RMSNorm seam **fires on a
 120B MoE model** (gpt-oss fuses its activation into the MoE kernel, so `SiluAndMul`
 is inert but `RMSNorm` fires), the cheat is caught hard (75%→0%), and the gate
 caught a *subtle* real drift a per-op check missed.
-
-**gpt-oss-120b (MXFP4) on 4× RTX PRO 6000 Blackwell (sm120) — first throughput win, through SlotSpec:**
-
-The `moe.fused_experts_mxfp4` bundle implements GPT-OSS's MXFP4 fused experts (CUTLASS
-MXFP8×MXFP4, autotuned) as a `(prepare, forward)` **block** slot, routed in via the
-`FusedMoE.forward` seam — no sglang fork. Apples-to-apples, TP=4, batch 32, eager:
-
-| MoE path | tok/s | forks sglang? |
-|---|---|---|
-| stock sm120 best (triton + CUDA graphs) | 767 | — |
-| **seam → MXFP4 kernel (autotuned)** | **912–922** | **no** |
-| hand-forked `flashinfer_mxfp4` backend | 926 | yes |
-
-The seam **ties the forked backend (~99%)** while the validator runs stock pinned sglang,
-and beats the stock-realizable path by **+19%**. On sm120 stock sglang is *forced* onto the
-triton MoE fallback (the `flashinfer_*` MoE backends crash there), so triton isn't a weak
-baseline we chose — it's what sglang can run; the seam recovers the optimized backend's speed
-without forking. Fidelity is gated by a new **`cosine`** correctness mode (0.985 vs the fp32
-reference; element-wise tolerance is meaningless at fp4 per-element error).
-
-Run **eager** with GPU headroom for the first-forward `prepare` (which pads/quantizes the dense
-experts): the eval's `mem_fraction_static≈0.6` works as-is; at `0.85` set full-eager
-(`disable_piecewise_cuda_graph`) **and** `OPTIMA_MOE_FREE_DENSE=1` (reclaims the dense bf16 experts
-after prepare — the kernel owns its MXFP4 copies). The production-clean fix (any mem_fraction) is
-load-time weight conversion — tracked. The meaningful next arena is **B200/sm100**, where sglang's
-FP4 MoE genuinely works and is heavily tuned.
 
 ### Calibration findings (from running on real hardware)
 
@@ -116,7 +86,7 @@ FP4 MoE genuinely works and is heavily tuned.
 2. **Benchmark accuracy needs large n.** At n=12, GSM8K has a ~12% std; a 2-problem
    flip reads as "−16.7%." Use **KL as the dense, low-variance primary gate** and
    **benchmark accuracy as a capability floor at ~100–200 samples**.
-3. **For a quantized model there's no fp32 ground truth** (gpt-oss is MXFP4), so the
+3. **For a quantized model there's no fp32 ground truth** (gpt-oss is natively quantized), so the
    KL reference is the stock-kernel run; the threshold must tolerate benign
    rounding in either direction.
 4. **Big MoE models need per-launch process isolation + deterministic scoring.**
@@ -151,7 +121,7 @@ FP4 MoE genuinely works and is heavily tuned.
 
 ```
 optima/
-  slots.py                  # the slot ABI: SlotSpec catalog (7 slots; kind = op|block|collective)
+  slots.py                  # the slot ABI: SlotSpec catalog (6 slots; kind = op|block|collective)
   manifest.py               # bundle manifest parse + path-safety
   sandbox.py                # static policy scan + isolated load (defense-in-depth)
   registry.py               # kernel registry + eligibility + active toggle
@@ -179,7 +149,6 @@ examples/
   miner_rmsnorm_{triton,broken}/               # rmsnorm slot (faithful / adversarial)
   miner_attention_torch/ miner_attention_decode_torch/   # attention.sdpa / attention.decode (blocks)
   miner_moe_fused_experts_torch/               # moe.fused_experts (block)
-  miner_moe_mxfp4_sm120/                       # moe.fused_experts_mxfp4 — the sm120 throughput win
   miner_allreduce_torch/                       # collective.all_reduce
 tests/                                  # 75 tests (scanner, manifest, KL, verify, block/moe seams, collective, rebuild, commit-reveal)
 ```
@@ -226,7 +195,7 @@ SP=$(.venv/bin/python -c 'import site;print(site.getsitepackages()[0])')
 echo 'import optima.bootstrap' > "$SP/optima.pth"     # install the seam everywhere
 export CUDA_HOME=/usr/local/cuda
 export PATH=/usr/local/cuda/bin:$PWD/.venv/bin:$PATH   # sglang JIT needs nvcc+ninja
-export TORCH_CUDA_ARCH_LIST=9.0                        # 9.0=H100, 12.0=RTX Blackwell
+export TORCH_CUDA_ARCH_LIST=9.0                        # set to your GPU arch (9.0=H100, 10.0=B200)
 
 # op-correctness on device
 .venv/bin/python -m optima.cli verify examples/miner_rmsnorm_triton --device cuda
@@ -240,7 +209,7 @@ export TORCH_CUDA_ARCH_LIST=9.0                        # 9.0=H100, 12.0=RTX Blac
 .venv/bin/python -m optima.cli bench examples/miner_silu_triton \
     --model Qwen/Qwen2.5-1.5B-Instruct --benchmarks gsm8k,mmlu --samples 64
 
-# gpt-oss-120b TP=4 on Blackwell (sm_120a): plain-triton MoE, custom-allreduce off
+# gpt-oss-120b TP=4 (multi-GPU): plain-triton MoE, custom-allreduce off
 .venv/bin/python -m optima.cli bench examples/miner_rmsnorm_broken \
     --model openai/gpt-oss-120b --benchmarks gsm8k,mmlu --samples 16 \
     --tp-size 4 --moe-runner-backend triton --disable-custom-all-reduce \
@@ -258,7 +227,7 @@ fallback, and does the registration. Adding a slot is a validator action in
 handed the process group, verified distributed). Correctness is `allclose` for bit-faithful
 ops, `matched_ratio` (≥ρ of elements within tol vs high-precision ground truth) for kernels
 that legitimately differ (attention/fp8/absorbed), or `cosine` (vs the HP reference) for
-low-bit kernels where element-wise tolerance is meaningless (MXFP4/MXFP8). **Seven slots
+low-bit kernels where element-wise tolerance is meaningless (FP4/FP8). **Six slots
 today:**
 
 - `activation.silu_and_mul` — `entry(x, out)` — Qwen/Llama-class MLP (op).
@@ -270,10 +239,7 @@ today:**
   it (block; eager-only gather MVP — a paged-direct, CUDA-graph-safe contract is next).
 - `moe.fused_experts` — `(prepare, forward)` pair — SwiGLU fused experts; `prepare` owns
   the weight layout once at load, `forward(x, topk_ids, topk_weights, prepared, out)` runs
-  per step (block).
-- `moe.fused_experts_mxfp4` — the MXFP4 variant that **is the sm120 throughput win**:
-  `prepare` repacks/interleaves MXFP4 weights+scales, `forward` MXFP8-quantizes and calls
-  CUTLASS fused-MoE; gated by `cosine` (block).
+  per step (block; a quantized kernel carries its FP4/FP8 weight layout in `prepare`).
 - `collective.all_reduce` — `entry(x, out, group)` — TP all-reduce (the comms waist); the
   validator owns the buffer + the process group; verified distributed vs the fp32
   cross-rank sum (`optima.verify_collective`).
@@ -329,8 +295,8 @@ cross-validator consensus catches a rogue validator.
 
 | Concern | Now | Production |
 |---|---|---|
-| Slots | 7: silu/rmsnorm, attention.sdpa/decode, MoE(+MXFP4), all-reduce | + MLA, GEMM, comms-overlap blocks |
-| Throughput gain | **first win: sm120 MXFP4 MoE (seam ties the forked backend)** | novel kernels beating mature tuned baselines |
+| Slots | 6: silu/rmsnorm, attention.sdpa/decode, MoE, all-reduce | + MLA, GEMM, comms-overlap blocks |
+| Throughput gain | **none — no submitted kernel beats sglang yet** | a kernel that beats sglang at equal fidelity |
 | Model | up to gpt-oss-120b (1 GPU) | DSV4-scale (multi-GPU, TP/PD/EP) |
 | Quality gate | KL + GSM8K/MMLU on real prompts, **uncalibrated** | noise-floor KL + large-n benchmarks + det mode |
 | Isolation | scan + in-proc load | namespaces + no-egress + per-eval ctx + watchdog |

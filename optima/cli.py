@@ -430,7 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="eager mode for quick debugging; DEGRADES the baseline — never score with this")
     sp.add_argument("--tp-size", type=int, default=None, help="tensor-parallel size (multi-GPU)")
     sp.add_argument("--moe-runner-backend", default=None,
-                    help="sglang MoE backend (e.g. 'triton' for gpt-oss TP on Blackwell sm_120a)")
+                    help="sglang MoE backend (e.g. 'triton')")
     sp.add_argument("--candidate-moe-runner-backend", default=None,
                     help="candidate-only MoE backend override (framework-mode backend swaps)")
     sp.add_argument("--disable-custom-all-reduce", action="store_true",
@@ -488,7 +488,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="eager mode for quick debugging; DEGRADES the baseline — never score with this")
     sp.add_argument("--tp-size", type=int, default=None, help="tensor-parallel size (multi-GPU)")
     sp.add_argument("--moe-runner-backend", default=None,
-                    help="sglang MoE backend (e.g. 'triton' for gpt-oss TP on Blackwell sm_120a)")
+                    help="sglang MoE backend (e.g. 'triton')")
     sp.add_argument("--candidate-moe-runner-backend", default=None,
                     help="candidate-only MoE backend override (framework-mode backend swaps)")
     sp.add_argument("--disable-custom-all-reduce", action="store_true",

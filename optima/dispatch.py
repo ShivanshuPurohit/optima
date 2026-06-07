@@ -227,11 +227,11 @@ def make_moe_dispatcher(
     baseline_forward: Callable[..., object],
     *,
     registry: KernelRegistry = REGISTRY,
-    slots: tuple[str, ...] = ("moe.fused_experts_mxfp4", "moe.fused_experts"),
+    slots: tuple[str, ...] = ("moe.fused_experts",),
 ) -> Callable[..., object]:
     """Build a replacement for ``FusedMoE.forward`` — the single chokepoint every MoE
     layer funnels through (``sglang.srt.layers.moe.fused_moe_triton.layer``), so the
-    seam is backend-agnostic (triton / cutlass sm90 / sm100 / sm120 / marlin all sit
+    seam is backend-agnostic (the triton / cutlass / marlin MoE backends all sit
     *below* it).
 
     MoE experts are a *block*, and a (prepare, forward) one: the validator owns routing
@@ -243,10 +243,9 @@ def make_moe_dispatcher(
     no final output to substitute, the same property that makes the op slots safe, and
     no source patch / engine reconfigure (unlike the framework/rebuild path).
 
-    ARCHITECTURE-GENERAL by design: nothing here is sm120-specific. A miner kernel
-    declares the arch(es) it supports via eligibility; the dispatcher routes to it only
-    on matching hardware and otherwise trusts the baseline. (sm120 was merely the first
-    box with a real win; the B200/sm100 endgame uses the identical contract.)
+    ARCHITECTURE-GENERAL by design: nothing here is hardware- or model-specific. A miner
+    kernel declares the arch(es)/dtype(s) it supports via eligibility; the dispatcher
+    routes to it only on matching hardware and otherwise trusts the baseline.
 
     SCOPE (MVP, mirrors the attention seam): routes the **standard** routing format
     through the ``moe.fused_experts`` contract, **eager-only** and **non-expert-parallel**
@@ -368,9 +367,9 @@ def _moe_supported(self) -> bool:
     if not (hasattr(self, "w13_weight") and hasattr(self, "w2_weight")):
         return False
     # Dense (unquantized) experts only for now: a quantized layer exposes packed FP4/FP8
-    # bytes plus separate *_scale params, which the dense contract would mis-read. The
-    # quantized win (GPT-OSS MXFP4, the B200 endgame) needs the richer weight view — the
-    # explicit next rung — so fall back until that lands rather than feed prepare() bytes.
+    # bytes plus separate *_scale params, which the dense contract would mis-read. A
+    # quantized expert kernel needs the richer weight view (the explicit next rung), so
+    # fall back until that lands rather than feed prepare() raw packed bytes.
     if hasattr(self, "w13_weight_scale") or hasattr(self, "w2_weight_scale"):
         return False
     return True
@@ -422,7 +421,7 @@ def _moe_prepared(self, impl, slot):
 
 def _maybe_free_dense_weights(self) -> None:
     """OPT-IN (``OPTIMA_MOE_FREE_DENSE=1``): release this layer's dense bf16 expert
-    weights once the miner kernel holds its own (MXFP4) copies — the dequantized
+    weights once the miner kernel holds its own (packed/quantized) copies — the dequantized
     originals are dead weight (~4x the size of the packed copies). This lowers
     steady-state residency so the engine can run at a higher mem_fraction.
 
@@ -473,7 +472,7 @@ def make_allreduce_dispatcher(
     every tensor-parallel reduce funnels through (``sglang.srt.distributed.parallel_state``).
 
     The TP all-reduce is the largest single category of decode time at scale (~32–43%),
-    and it is latency-bound — so the win is a lower-latency reduce or a compute-comm
+    and it is latency-bound — so the lever is a lower-latency reduce or a compute-comm
     overlap, both expressible here. The validator owns the output buffer, the process
     group, and the call site; the miner only fills ``out`` with the cross-rank sum. The
     reduce is mid-network (upstream of the sampler) → no output to substitute.

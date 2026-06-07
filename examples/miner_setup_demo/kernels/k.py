@@ -5,8 +5,8 @@ sglang's RMSNorm to scale its output by 0.9 — i.e. it CORRUPTS the model via a
 *framework-level* patch (not the slot kernel). The point: a setup() that breaks the
 model must be caught. In ``--framework-mode`` the validator gates on token-match vs the
 stock baseline, so this bundle's generated tokens diverge -> FAIL, even though the silu
-forward itself is faithful. A real setup() (e.g. the sm120 flashinfer fixes that OPEN a
-surface without changing the output) keeps token-match high -> PASS.
+forward itself is faithful. A real setup() (e.g. fixing a broken backend on new hardware
+to OPEN a surface without changing the output) keeps token-match high -> PASS.
 """
 
 from __future__ import annotations

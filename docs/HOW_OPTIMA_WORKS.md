@@ -14,14 +14,14 @@ This is the long-form explainer. By the end you should understand, with no gaps:
 It points at every file. Paths are relative to this doc (`docs/`), so
 `../optima/slots.py` is the harness module `optima/slots.py`.
 
-> **Current scope (kept in sync):** seven slots — `activation.silu_and_mul`,
-> `norm.rmsnorm` (ops); `attention.sdpa` / `attention.decode`, `moe.fused_experts` /
-> `moe.fused_experts_mxfp4` (blocks); `collective.all_reduce` (collective) — two quality
-> gates (per-token **KL** *and* real **benchmark accuracy** — Part 6), validated up to
-> **gpt-oss-120b**. `README.md` is the live state-of-record (results + calibration); if it
-> disagrees with this doc, README wins. There is now a **first throughput win** (the sm120
-> MXFP4 MoE block, at forked-backend parity *through the seam* — README has the numbers);
-> the small demos (silu/rmsnorm/attention) still just validate the referee.
+> **Current scope (kept in sync):** six slots — `activation.silu_and_mul`,
+> `norm.rmsnorm` (ops); `attention.sdpa` / `attention.decode`, `moe.fused_experts`
+> (blocks); `collective.all_reduce` (collective) — two quality gates (per-token **KL**
+> *and* real **benchmark accuracy** — Part 6), validated up to **gpt-oss-120b**.
+> `README.md` is the live state-of-record (results + calibration); if it disagrees with
+> this doc, README wins. **No submitted kernel has beaten sglang** — this validates the
+> referee, not any optimization; the example kernels are correctness demos, slower than
+> sglang's own.
 
 > Reading order: Parts 1–3 are the mental model. Part 4 is the pipeline. Part 5
 > is the clever bit (how a kernel gets into the model). Parts 6–7 are scoring and
@@ -156,9 +156,9 @@ targets and *where* the kernel source lives. It does not run anything yet.
 
 The set of operations a miner is allowed to replace is the **slot catalog**,
 owned by the validator in [../optima/slots.py](../optima/slots.py). Today there are
-seven slots across three `kind`s — `op` (`activation.silu_and_mul`, `norm.rmsnorm`),
-`block` (`attention.sdpa`, `attention.decode`, `moe.fused_experts`,
-`moe.fused_experts_mxfp4`), and `collective` (`collective.all_reduce`). A slot
+six slots across three `kind`s — `op` (`activation.silu_and_mul`, `norm.rmsnorm`),
+`block` (`attention.sdpa`, `attention.decode`, `moe.fused_experts`), and `collective`
+(`collective.all_reduce`). A slot
 (`SlotSpec`) declares everything the validator needs to *use* and *verify* a kernel
 without trusting it:
 
@@ -709,11 +709,11 @@ a controlled demo, not for adversaries.
 
 ## Part 9 — What is proven (on a real H100)
 
-Validated on real GPUs (H100, then 4× RTX PRO 6000 Blackwell sm120; sglang
-0.5.12.post1 / CUDA 13, torch 2.11/2.12+cu130), Qwen2.5 up to gpt-oss-120b:
+Validated on a real H100 (sglang 0.5.12.post1 / CUDA 13, torch 2.11+cu130), Qwen2.5
+up to gpt-oss-120b:
 
 - **The seam works on real models, including a 120B MoE.** Confirmed because the
-  *broken* kernel changes the output. Seven slots across op / block / collective kinds;
+  *broken* kernel changes the output. Six slots across op / block / collective kinds;
   e.g. `norm.rmsnorm` fires on gpt-oss (whose activation is fused into the MoE kernel so
   silu is inert), and the `FusedMoE.forward` block seam routes gpt-oss's experts to the
   miner kernel.
@@ -730,19 +730,13 @@ Validated on real GPUs (H100, then 4× RTX PRO 6000 Blackwell sm120; sglang
   (`mark_driver`); a faithful-but-slower kernel correctly earns no title.
 - **Commit-reveal + king-of-the-hill**: commit→reveal→evaluate→settle, copy
   detection, margin gate. 75 unit tests green.
-- **gpt-oss-120b at MXFP4 fits one 80 GB H100** (~69 GB), so the bootstrap doesn't
-  need a B200 cluster.
-- **First throughput win, through SlotSpec:** the `moe.fused_experts_mxfp4` block routes
-  gpt-oss-120b's experts through the `FusedMoE.forward` seam on sm120 at **~912–922 tok/s
-  (TP=4, batch 32)** — tying the hand-forked `flashinfer_mxfp4` backend (~926) with no
-  fork, **+19% over the stock-realizable triton fallback**. Gated by the `cosine`
-  correctness mode (fp4 element-wise tolerance is meaningless). README has the table.
+- **gpt-oss-120b fits one 80 GB H100** (~69 GB at its native quantization), so the
+  bootstrap doesn't need a B200 cluster.
 
-**Honest caveat:** that win is a *route-to-a-faster-existing-path-via-the-seam* on a
-frontier (sm120) where stock sglang has only a slow fallback — **not** a novel
-hand-written kernel beating a mature tuned baseline, which is still open. The
-silu/rmsnorm/attention example kernels remain toy demos, *slower* than sglang's tuned
-kernels; they validate the *referee*. See README for the live numbers.
+**What is NOT proven:** no submitted kernel has beaten sglang at anything. Every example
+kernel is a correctness demo — the faithful ones reproduce the model but are *slower* than
+sglang's own tuned kernels; the broken ones are caught by the gate. This validates the
+*referee*; the optimization side is unproven.
 
 ---
 
@@ -753,12 +747,12 @@ In rough priority:
 1. **Isolation** (8.4): per-eval process + namespaces + no network egress + GPU
    context isolation + watchdog. *Required before untrusted miners.* Today the VM
    is the trust boundary.
-2. **More (bigger) slots**: seven slots exist (silu/rmsnorm ops; attention.sdpa/decode,
-   MoE + MXFP4 blocks; all-reduce collective), and the MXFP4 MoE is the first real
-   throughput win. The remaining prizes are MLA/weight-absorbed attention, dense FP8/FP4
-   GEMM, and *comms-overlap* blocks (a block that owns its trailing reduce) — plus the
-   multi-GPU surface (TP / PD-disaggregation / EP). Each new slot is a `SlotSpec` + a seam
-   patch. **The frontier: a novel kernel beating a mature tuned baseline, on the B200/sm100 arena.**
+2. **A kernel that actually beats sglang** — the whole point, still unproven. Six slots
+   exist (silu/rmsnorm ops; attention.sdpa/decode, MoE blocks; all-reduce collective), but
+   they're correctness demos, not speedups. The prizes are MLA/weight-absorbed attention,
+   dense FP8/FP4 GEMM, and *comms-overlap* blocks (a block that owns its trailing reduce) —
+   plus the multi-GPU surface (TP / PD-disaggregation / EP). Each new slot is a `SlotSpec` +
+   a seam patch; the hard part is a kernel that wins, not the wiring.
 3. **Cross-validator determinism**: locked clocks, pinned HW/driver, deterministic
    mode on, more medians — so independent validators agree (Bittensor consensus).
 4. **Full-logit KL** at a reference seam (vs top-k) for the tightest fidelity gate.
@@ -775,7 +769,7 @@ The harness package, [../optima/](../optima):
 
 | File | Role |
 |---|---|
-| [slots.py](../optima/slots.py) | The slot ABI. `SlotSpec` (`invoke_reference`/`invoke_entry` for non-uniform signatures, `kind` = op/block/collective, a `Correctness` mode, `prepare`/`prepare_from_layer` for quant-layout slots), the **7 slots** (silu, rmsnorm, attention.sdpa/decode, moe.fused_experts/_mxfp4, collective.all_reduce), references, input generators, tolerances. Adding a slot = editing here. |
+| [slots.py](../optima/slots.py) | The slot ABI. `SlotSpec` (`invoke_reference`/`invoke_entry` for non-uniform signatures, `kind` = op/block/collective, a `Correctness` mode, `prepare`/`prepare_from_layer` for quant-layout slots), the **6 slots** (silu, rmsnorm, attention.sdpa/decode, moe.fused_experts, collective.all_reduce), references, input generators, tolerances. Adding a slot = editing here. |
 | [manifest.py](../optima/manifest.py) | Parse + validate `manifest.toml`. Schema + ABI check + **path-safety** (`_safe_relpath`). Pure-Python. |
 | [sandbox.py](../optima/sandbox.py) | `scan_source` (AST policy tripwire), `load_entry` (import the kernel — isolate in prod), `probe_in_subprocess`. |
 | [registry.py](../optima/registry.py) | `KernelRegistry` (process-global `REGISTRY`), `KernelImpl`, `Eligibility`. The dispatcher's lookup table + active toggle. |
@@ -785,7 +779,7 @@ The harness package, [../optima/](../optima):
 | [integrations/sglang_silu.py](../optima/integrations/sglang_silu.py) | Patches `SiluAndMul.forward_cuda/native`; `rebind_existing` safety net. |
 | [integrations/sglang_norm.py](../optima/integrations/sglang_norm.py) | Patches `RMSNorm.forward_cuda/native` (fires on gpt-oss and every transformer). |
 | [integrations/sglang_attention.py](../optima/integrations/sglang_attention.py) | Patches `RadixAttention.forward` (the attention **block** chokepoint; gathers paged KV for the decode swap). |
-| [integrations/sglang_moe.py](../optima/integrations/sglang_moe.py) | Patches `FusedMoE.forward` (the MoE **block** chokepoint; opt-in `OPTIMA_MOE_SEAM=1` — the sm120 MXFP4 win). |
+| [integrations/sglang_moe.py](../optima/integrations/sglang_moe.py) | Patches `FusedMoE.forward` (the MoE **block** chokepoint; opt-in `OPTIMA_MOE_SEAM=1`). |
 | [integrations/sglang_allreduce.py](../optima/integrations/sglang_allreduce.py) | Patches `GroupCoordinator.all_reduce` (the **collective** chokepoint; opt-in `OPTIMA_COLLECTIVE_SEAM=1`). |
 | [integrations/sglang_plugin.py](../optima/integrations/sglang_plugin.py) | Entry-point shim for sglang builds that *have* the plugin framework (not the pin). |
 | [verify.py](../optima/verify.py) | `verify_entry` — op/block correctness vs the slot's HP reference (`allclose` / `matched_ratio` / `cosine`); refuses `kind="collective"`. |
@@ -805,8 +799,8 @@ The harness package, [../optima/](../optima):
 Examples [../examples/](../examples): one (or more) bundle per slot —
 `miner_silu_{triton,torch,broken,sparse}`, `miner_rmsnorm_{triton,broken}`,
 `miner_attention_torch` / `miner_attention_decode_torch`, `miner_moe_fused_experts_torch`,
-`miner_moe_mxfp4_sm120` (the sm120 win), `miner_allreduce_torch` (`*_broken` = adversarial,
-must FAIL). Tests [../tests/](../tests) (75 across 9 files): `test_static.py`
+`miner_allreduce_torch` (`*_broken` = adversarial, must FAIL). Tests
+[../tests/](../tests) (75 across 9 files): `test_static.py`
 (scanner/manifest/eligibility/KL), `test_verify_cpu.py` + `test_slots_block.py` +
 `test_moe_seam.py` (op/block correctness), `test_collective.py` (distributed verify),
 `test_rebuild.py`, `test_isolation.py`, `test_benchmarks.py`, `test_commit_reveal.py`

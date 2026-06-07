@@ -45,29 +45,20 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   (same cheat-resistant contract — validator allocates outputs, miner fills them, the
   kernel never reaches the sampler — just a wider boundary): `activation.silu_and_mul`,
   `norm.rmsnorm` (ops); `attention.sdpa`/`attention.decode` (blocks via the
-  `RadixAttention.forward` seam, `OPTIMA_ATTENTION_SEAM=1`); `moe.fused_experts` /
-  `moe.fused_experts_mxfp4` (blocks via the `FusedMoE.forward` seam, `OPTIMA_MOE_SEAM=1`);
-  and `collective.all_reduce` (the TP comms waist, via the `GroupCoordinator.all_reduce`
-  seam, `OPTIMA_COLLECTIVE_SEAM=1` — verified distributed by `optima.verify_collective`).
-- **First real throughput win — through SlotSpec, on real GPUs.** On 4× RTX PRO 6000
-  Blackwell (sm120), the `moe.fused_experts_mxfp4` bundle (MXFP4 cutlass fused-MoE,
-  autotuned) routes gpt-oss-120b's experts through the seam at **~912–922 tok/s, TP=4
-  batch 32 — matching the hand-forked `flashinfer_mxfp4` backend (~926) with NO fork**
-  (validator runs stock pinned sglang). Stock sglang is *forced* onto the triton MoE
-  fallback on sm120 (the `flashinfer_*` MoE backends crash there), so this both ties the
-  forked best and beats the stock-realizable path (+19%). Gated by a new `cosine`
-  correctness mode (fp4: element-wise tolerance is meaningless). The silu/rmsnorm/attention
-  demos are still toy/slow — they prove the contract; the MXFP4 MoE is the first speed win.
-  Run **eager** with mem headroom for the first-forward `prepare` (eval uses `mem≈0.6`; or `0.85`
-  + `disable_piecewise_cuda_graph` + `OPTIMA_MOE_FREE_DENSE=1`, which frees the dense bf16 experts).
-  **Next arena: B200/sm100**, where sglang's FP4 MoE genuinely works and is heavily tuned.
-- **Open:** a novel kernel beating a *mature* tuned baseline (the MXFP4 win ties a
-  forked backend on a frontier where stock only has a slow fallback — not the same as
-  beating a tuned path), isolation for untrusted miners, chain integration, a real DB,
-  bigger slots (MLA/weight-absorbed attention, FP8/FP4 GEMM, comms-overlap blocks that
+  `RadixAttention.forward` seam, `OPTIMA_ATTENTION_SEAM=1`); `moe.fused_experts` (block
+  via the `FusedMoE.forward` seam, `OPTIMA_MOE_SEAM=1`); and `collective.all_reduce`
+  (the TP comms waist, via the `GroupCoordinator.all_reduce` seam,
+  `OPTIMA_COLLECTIVE_SEAM=1` — verified distributed by `optima.verify_collective`).
+- **No kernel has beaten sglang.** The mechanism is validated to fire correctly on real
+  models (a faithful kernel reproduces the model; a broken one is caught by the gate), but
+  every example kernel is a correctness demo — the faithful ones are *slower* than sglang's
+  own tuned kernels. The optimization side is unproven: nothing submitted moves throughput.
+- **Open — the actual goal:** a submitted kernel that genuinely beats sglang at equal
+  fidelity (none does yet). Plus isolation for untrusted miners, chain integration, a real
+  DB, bigger slots (MLA/weight-absorbed attention, FP8/FP4 GEMM, comms-overlap blocks that
   own their trailing reduce), and **eval calibration** (KL threshold = k× the measured
-  nondeterminism noise floor; run with `enable_deterministic_inference`; benchmark
-  accuracy needs large n).
+  nondeterminism noise floor; run with `enable_deterministic_inference`; benchmark accuracy
+  needs large n).
 
 ## How to run
 
@@ -91,12 +82,9 @@ matters — sglang uses `mp spawn`).
   runs the model in a spawned child. Don't expect parent-process patching to work.
 - sglang's `jit_kernel` JIT-compiles CUDA at runtime → the box needs `nvcc` +
   `ninja` on PATH (`export CUDA_HOME=/usr/local/cuda`). Set `TORCH_CUDA_ARCH_LIST`
-  to the GPU arch (9.0 = H100, 12.0 = RTX PRO 6000 Blackwell, 10.0 = B200).
-- gpt-oss-120b fits a single H100 in the validated Hopper path. On the 4× RTX PRO
-  6000 Blackwell box, stock pinned sglang still needs the plain Triton MoE fallback
-  at TP=4; the current dev-pod experiment gets `flashinfer_mxfp4` working on
-  `sm_120a` by padding GPT-OSS shards, using plain packed FP4 weights, interleaving
-  only MXFP4 block scales, and disabling PDL for that call. See
+  to the GPU arch (9.0 = H100, 10.0 = B200).
+- gpt-oss-120b fits a single H100 in the validated Hopper path. Multi-GPU (TP) runs on
+  other boxes select the MoE backend via `--moe-runner-backend`; see
   `docs/DEV_ENVIRONMENT.md`.
 - Adding a slot = a `SlotSpec` in `optima/slots.py` (set `kind="op"` or `"block"`;
   use `Correctness("matched_ratio", ...)` for kernels that legitimately differ from

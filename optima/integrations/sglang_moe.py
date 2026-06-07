@@ -6,10 +6,10 @@ layer funnels through: ``FusedMoE.forward`` in
 ``sglang.srt.layers.moe.fused_moe_triton.layer``. Routing (gate -> top-k) runs
 upstream and is handed in as ``topk_output``, so this is exactly the
 "run the experts given the routing" boundary — backend-agnostic (it sits above
-triton / cutlass sm90 / sm100 / sm120 / marlin alike).
+the triton / cutlass / marlin MoE backends alike).
 
-This is the cheat-resistant home for an expert-kernel win (e.g. the GPT-OSS MXFP4
-fused MoE): the validator owns routing, the expert weights, and the output buffer;
+This is the cheat-resistant home for an expert-kernel submission: the validator owns
+routing, the expert weights, and the output buffer;
 the miner only repacks the weights once (``prepare``) and fills the output each step
 (``entry``). The combined output feeds the residual stream + downstream layers +
 sampler (all stock) — no final output to substitute, and no sglang source patch or

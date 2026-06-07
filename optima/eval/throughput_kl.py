@@ -85,9 +85,9 @@ class EvalConfig:
     disable_cuda_graph: bool = False
     mem_fraction_static: float = 0.6
     log_level: str = "warning"
-    # multi-GPU knobs (gpt-oss TP=4 on Blackwell sm_120a needs moe_runner_backend
-    # "triton" + custom-allreduce off; see docs/DEV_ENVIRONMENT.md). Left unset by
-    # default so single-GPU runs are byte-for-byte unchanged.
+    # multi-GPU knobs (TP size, MoE backend, custom-allreduce toggle for tensor-parallel
+    # runs; see docs/DEV_ENVIRONMENT.md). Left unset by default so single-GPU runs are
+    # byte-for-byte unchanged.
     tp_size: Optional[int] = None
     moe_runner_backend: Optional[str] = None
     disable_custom_all_reduce: bool = False

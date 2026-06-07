@@ -3,10 +3,9 @@
 A *prepare+forward* slot: a quant/layout-sensitive kernel is a PAIR. ``prepare`` runs
 ONCE at load to lay out the expert weights the way ``forward``'s kernel wants;
 ``forward`` runs per step. Here ``prepare`` reorders the fused w13 from ``[gate; up]``
-to ``[up; gate]`` (mirroring the GPT-OSS sm120 W13 repack), and ``forward`` consumes
-that order. A real Blackwell submission would do MXFP4 weight + block-scale layout in
-``prepare`` and a fused CUTLASS MoE (`flashinfer.cutlass_fused_moe`) in ``forward``;
-this pure-torch version proves the (prepare, forward) contract.
+to ``[up; gate]``, and ``forward`` consumes that order. A real quantized submission
+would do the packed FP4/FP8 weight + block-scale layout in ``prepare`` and a fused GEMM
+in ``forward``; this pure-torch version exercises the (prepare, forward) contract.
 """
 
 from __future__ import annotations

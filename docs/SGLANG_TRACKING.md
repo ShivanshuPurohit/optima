@@ -86,57 +86,12 @@ it for:
 | **a fix that *opens a surface*** (an op that's broken in the pin starts running) | A **bump trigger**, not a permanent block — flag it; it argues for the next bump. |
 | **a fix that *is* the optimization** (upstream now does the fast thing) | That headroom is simply gone — fine; the product got faster regardless of who did it. |
 
-**Broken-in-the-pin is headroom, not a blocker.** Concrete: stock sglang's
-Blackwell (`sm_120a`) MoE is broken / slow-fallback in 0.5.9. That's not a wall —
-it's exactly where a miner can win, by beating the fallback, measured entirely under
-the pin. The dev-pod FlashInfer experiment confirms this: correcting MXFP4 scale
-layout and disabling PDL makes GPT-OSS-120B TP=4 coherent and faster than the plain
-Triton fallback on the RTX PRO 6000 Blackwell box. If a later sglang ships a fast
-sm_120 MoE, the validator bumps to it, the headroom shrinks, and the competition
-moves to a stronger baseline. Either way a miner never needs to *submit* against
-experimental sglang.
-
-The same target was also replicated on a latest-stable dev venv
-(`torch==2.12.0+cu130`, `sglang==0.5.12.post1`, `flashinfer-python==0.6.12`).
-That newer stack needed a smaller SGLang-side patch: add the SM120
-FlashInfer-MXFP4 branch and allocate GPT-OSS TP=4 MXFP4 shards using checkpoint
-block-ceil padding (`720` logical intermediate values, `736` loaded values,
-`768` CUTLASS-aligned values). On the 4x RTX PRO 6000 Blackwell dev pod, batch-32
-GPT-OSS-120B TP=4 decode with piecewise CUDA graph disabled passed the
-standardized runner: patched `flashinfer_mxfp4` measured `915.6 tok/s` median
-versus plain `triton` at `742.6 tok/s` median, a `1.23x` speedup. The same
-runner recorded loader smoke, synthetic SwiGLU cosine `0.9999302`, stock
-FlashInfer non-completion, startup time separately from throughput, and one
-CUDA-graph-enabled serving sanity run. A previous manual batch-32 run measured
-`926.7 tok/s` versus `741.6 tok/s`.
-
-Important baseline correction: the no-graph `742.6 tok/s` Triton run is an
-isolation baseline, not the strongest stock SGLang can do. A later best-stock
-sweep enabled CUDA graph capture, radix cache, explicit attention-backend
-choices, and custom all-reduce finalist checks. Under that stronger setup, stock
-SGLang's best successful GPT-OSS-120B TP=4 batch-32 result on the same Blackwell
-pod was `830.7 tok/s` (`triton` MoE, `triton` attention, CUDA graph, radix
-cache). The patched `flashinfer_mxfp4` path reached `1062.4 tok/s` with the
-symmetric CUDA-graph/radix setup plus custom all-reduce, a `1.28x` speedup over
-the stronger stock baseline. Stock `attention_backend=flashinfer` did not
-complete on this stack, FA3 was unavailable in `sgl_kernel`, and custom
-all-reduce did not beat the non-custom stock finalist on the PCIe topology.
-A separate long-context sanity run padded prompts to about 2k tokens and forced
-1024 generated tokens per prompt at batch 4. Stock measured `321.6 tok/s`, the
-patched path measured `402.1 tok/s` (`1.25x`), and both produced the expected
-fixed arithmetic answers in all timed iterations.
-
-Trying to respect SGLang's own dependency metadata is still the right hygiene
-goal. With `uv --torch-backend cu130 --prerelease=allow`, `sglang==0.5.12.post1`
-resolves to `torch==2.11.0+cu130`, `flashinfer-python==0.6.11.post1`,
-`sglang-kernel==0.4.2.post2`, and `xgrammar==0.2.0`. That packaged stack avoids
-the Torch 2.12 `sglang-kernel` ABI rebuild, and the candidate patch passes both
-the loader smoke and the synthetic SwiGLU probe. The full candidate model run
-currently aborts in FlashInfer/CUTE RMSNorm with `Expected an MLIR object`, so
-the packaged-stack blocker has moved out of MoE layout and into FlashInfer/CUTE
-runtime compatibility. That's the current best proof that "broken in the base"
-can be converted into a miner-grade throughput win rather than just a
-compatibility fix, while also showing why exact dependency capture matters.
+**Broken-in-the-pin is headroom, not a blocker.** When the pinned sglang has only a
+slow fallback for some op on some hardware (a new GPU arch, a new dtype), that's not a
+wall — it's exactly the place a miner could win, by beating the fallback, measured
+entirely under the pin. If a later sglang ships a fast kernel for that path, the
+validator bumps to it, the headroom shrinks, and the competition moves to a stronger
+baseline. Either way a miner never needs to *submit* against experimental sglang.
 
 **The pin protects miners, too.** Without it, a carefully-tuned kernel could
 silently go slower or break the moment a validator auto-updated sglang

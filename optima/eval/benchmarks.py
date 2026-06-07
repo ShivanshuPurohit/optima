@@ -241,8 +241,7 @@ class MMLU:
 # ---------------------------------------------------------------------------
 # Long-context fixed-answer math sanity benchmark.
 #
-# This mirrors the dev helper under experiments/sm120_flashinfer_moe closely enough
-# to run the same long-context / long-decode shape through ``optima bench``:
+# Runs a long-context / long-decode shape through ``optima bench``:
 # a small batch, irrelevant context padding, fixed arithmetic answers, and a
 # 1024-token decode budget. It is a throughput/coherence sanity check, not a
 # statistically meaningful math benchmark.

@@ -37,10 +37,10 @@ Some slots are a **(prepare, forward) pair**: a quantized / layout-sensitive ker
 (MoE experts, a quant GEMM) needs the *weights* in a custom layout, and that layout
 transform is part of the kernel. Such a slot names a second miner callable via
 ``prepare`` — it runs ONCE at load on the raw checkpoint weights, the validator holds
-the result, and ``entry`` (forward) consumes it each step as ``prepared``. This is how
-a win like the GPT-OSS sm120 MoE (repack W13, interleave the FP4 block scales, then a
-fused CUTLASS call) fits *one* slot: the repack/interleave is ``prepare``, the kernel
-is ``forward``.
+the result, and ``entry`` (forward) consumes it each step as ``prepared``. A quantized
+fused-MoE (repack the expert weights, interleave the FP4 block scales, then a fused
+GEMM) fits *one* slot this way: the repack/interleave is ``prepare``, the kernel is
+``forward``.
 
 Adding a slot is a validator action (a code change here), never a miner action.
 """
@@ -75,10 +75,9 @@ class Correctness:
       must be >= ``min_cosine``, with an optional relative-L2-norm guard
       (``max_rel_norm_err``) to catch a kernel that gets the direction right but the
       scale wrong. This is the correct fidelity metric for **low-bit** kernels
-      (MXFP4/MXFP8): element-wise tolerance is meaningless when every element carries
+      (FP4/FP8): element-wise tolerance is meaningless when every element carries
       ~6-12% quantization error, but the *direction* (and energy) of the block output
-      is preserved — which is what actually drives the model's logits. Measured on
-      sm120 GPT-OSS MoE: ~0.999 vs a dequant reference, ~0.99 vs fp32 ground truth.
+      is preserved — which is what actually drives the model's logits.
     """
 
     mode: str = "allclose"  # "allclose" | "matched_ratio" | "cosine"
@@ -358,16 +357,15 @@ ATTENTION_DECODE = SlotSpec(
 
 
 # ---------------------------------------------------------------------------
-# Slot (BLOCK, prepare+forward): moe.fused_experts   (the headroom slot)
+# Slot (BLOCK, prepare+forward): moe.fused_experts
 #   prepare(w13, w2) -> prepared              (weight layout; runs ONCE at load)
 #   forward(x, topk_ids, topk_weights, prepared, out)   (per step)
 #   x:(M,H)  w13:(E,2I,H)[gate;up]  w2:(E,H,I)  topk_ids/weights:(M,K) -> out:(M,H)
 #   SwiGLU-MLP experts: out = sum_k topk_w * (silu(gate)*up) @ w2.T over each token's
-#   top-k experts. This is the slot the GPT-OSS sm120 MoE win fits: the W13 repack +
-#   FP4 block-scale interleave are `prepare`; the fused CUTLASS call is `forward`. The
-#   pure-torch example reorders [gate;up]->[up;gate] in prepare to prove the contract; a
-#   real Blackwell submission carries MXFP4 weights + scales and calls flashinfer
-#   cutlass_fused_moe in forward (a sibling moe.fused_experts_mxfp4 slot, sm_100/sm_120).
+#   top-k experts. The (prepare, forward) split is what lets a quantized / layout-
+#   sensitive expert kernel fit one slot: a weight repack / FP4 block-scale interleave
+#   is `prepare`, the fused GEMM is `forward`. The pure-torch example reorders
+#   [gate;up]->[up;gate] in prepare to exercise the contract.
 # ---------------------------------------------------------------------------
 
 
@@ -386,30 +384,6 @@ def _moe_reference(x, w13, w2, topk_ids, topk_weights):
         fc1 = torch.einsum("mh,mih->mi", x32, w13_e)    # (M,2I)
         gate, up = fc1[:, :I], fc1[:, I:]
         act = F.silu(gate) * up                         # (M,I)
-        out += wk[:, None] * torch.einsum("mi,mhi->mh", act, w2_e)
-    return out
-
-
-def _moe_gptoss_reference(x, w13, w2, topk_ids, topk_weights, *, alpha=1.702, beta=1.0, limit=7.0):
-    # GPT-OSS expert MLP: a CLAMPED gated-SiLU (not plain silu(gate)*up). w13:(E,2I,H)
-    # rows [gate; up], w2:(E,H,I). act = clamp(gate)*sigmoid(alpha*clamp(gate))*(clamp(up)+beta).
-    # This is the high-precision reference the MXFP4 cutlass kernel is gated against.
-    M, H = x.shape
-    I = w13.shape[1] // 2
-    K = topk_ids.shape[1]
-    x32 = x.float()
-    out = torch.zeros(M, H, device=x.device, dtype=torch.float32)
-    lim = torch.tensor(float(limit), device=x.device)
-    for k in range(K):
-        e = topk_ids[:, k].long()
-        wk = topk_weights[:, k].float()
-        w13_e = w13[e].float()                         # (M,2I,H)
-        w2_e = w2[e].float()                           # (M,H,I)
-        fc1 = torch.einsum("mh,mih->mi", x32, w13_e)   # (M,2I)
-        gate, up = fc1[:, :I], fc1[:, I:]
-        gate_c = torch.minimum(gate, lim)
-        up_c = torch.clamp(up, -float(limit), float(limit))
-        act = gate_c * torch.sigmoid(gate_c * alpha) * (up_c + beta)  # (M,I)
         out += wk[:, None] * torch.einsum("mi,mhi->mh", act, w2_e)
     return out
 
@@ -462,51 +436,6 @@ MOE_FUSED_EXPERTS = SlotSpec(
 )
 
 
-MOE_FUSED_EXPERTS_MXFP4 = SlotSpec(
-    name="moe.fused_experts_mxfp4",
-    entry="fused_experts_mxfp4",
-    prepare="prepare",
-    summary=(
-        "MXFP4 fused MoE experts — a (prepare, forward) PAIR for GPT-OSS/Blackwell-style "
-        "expert kernels.  prepare(w13, w2) owns weight/scale layout (repack [gate;up]->[up;gate], "
-        "pack MXFP4, interleave scales) once at load;  forward(x, topk_ids, topk_weights, prepared, "
-        "out) MXFP8-quantizes x and runs the fused CUTLASS call.  Gated against the GPT-OSS clamped "
-        "gated-SiLU reference; matched_ratio tolerance calibrated to MXFP4/MXFP8 quant error."
-    ),
-    kind="block",
-    make_inputs=_moe_inputs,
-    out_shapes=lambda i: [(i["x"].shape[0], i["x"].shape[1])],
-    invoke_reference=lambda i: [_moe_gptoss_reference(i["x"], i["w13"], i["w2"], i["topk_ids"], i["topk_weights"])],
-    # Verify: synthetic dense [gate; up] block weights, no biases (a clean kernel-vs-
-    # reference check). The dict shape matches the live prepare_from_layer call.
-    invoke_prepare=lambda prepare_fn, i: prepare_fn({"w13": i["w13"], "w2": i["w2"]}),
-    # Live seam (gpt-oss): hand prepare the dequantized bf16 experts + biases; rows are
-    # HF-interleaved [gate0, up0, ...] so prepare de-interleaves to CUTLASS [up; gate].
-    prepare_from_layer=lambda layer: (
-        {
-            "w13": layer.w13_weight.data,
-            "w2": layer.w2_weight.data,
-            "w13_bias": layer.w13_weight_bias.data,
-            "w2_bias": layer.w2_weight_bias.data,
-            "interleaved": True,
-        },
-    ),
-    invoke_entry=lambda entry, i, outs, prepared: entry(i["x"], i["topk_ids"], i["topk_weights"], prepared, outs[0]),
-    # GPT-OSS-flavored, CUTLASS-MXFP4-valid dims (hidden 2880; intermediate a 32-block
-    # multiple). Small E so verify stays light. The fp4 kernel is NOT bit-exact, so the
-    # gate is matched_ratio vs the fp32 reference at a quant-calibrated tolerance.
-    shapes=(
-        {"num_tokens": 16, "num_experts": 8, "hidden": 2880, "inter": 736, "topk": 4},
-        {"num_tokens": 4, "num_experts": 4, "hidden": 2880, "inter": 736, "topk": 2},
-    ),
-    # Low-bit fidelity: cosine vs the fp32 reference (element-wise tolerance is
-    # meaningless at ~6-12% per-element fp4 error). min_cosine calibrated below; the
-    # rel-norm guard catches a kernel that gets direction right but energy wrong.
-    correctness=Correctness("cosine", min_cosine=0.97, max_rel_norm_err=0.0),
-    tolerances=_BF16_TOL,
-)
-
-
 # ---------------------------------------------------------------------------
 # Catalog
 # ---------------------------------------------------------------------------
@@ -522,7 +451,7 @@ MOE_FUSED_EXPERTS_MXFP4 = SlotSpec(
 # NOT verify_entry) against the trusted fp32 cross-rank sum. The reduce is mid-network
 # (upstream of the sampler) — no output to substitute. Decode is comms-bound (~32–43%
 # of GPU time at TP/EP scale, the largest single category), and it is *latency*-bound,
-# so the win is a lower-latency reduce or compute-comm overlap — both expressible here
+# so the lever is a lower-latency reduce or compute-comm overlap — both expressible here
 # while staying inside the four invariants. WIDER SURFACE: handing the miner the
 # communicator is more capability than "fill a tensor"; the invariants still bound it,
 # but distributed verify + the end-to-end gate are MANDATORY (docs/SLOT_CONTRACT.md).
@@ -572,7 +501,6 @@ SLOTS: dict[str, SlotSpec] = {
     ATTENTION_SDPA.name: ATTENTION_SDPA,
     ATTENTION_DECODE.name: ATTENTION_DECODE,
     MOE_FUSED_EXPERTS.name: MOE_FUSED_EXPERTS,
-    MOE_FUSED_EXPERTS_MXFP4.name: MOE_FUSED_EXPERTS_MXFP4,
     COLLECTIVE_ALL_REDUCE.name: COLLECTIVE_ALL_REDUCE,
 }
 

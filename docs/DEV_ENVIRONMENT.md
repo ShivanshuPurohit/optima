@@ -27,8 +27,10 @@ is configured (`~/.lium`). **Pod names/IPs change on redeploy — always run
 
 | Pod (name) | GPU | CUDA | Access | Notes |
 |---|---|---|---|---|
-| `brave-orbit-7c` | **4× RTX PRO 6000 Blackwell** (4×96 GB, GDDR7, no NVLink) | 13.0 | `154.54.100.130` | the **dev box** — TP / PD-disagg / EP / bigger models / Blackwell (FA4, nvfp4) |
 | `golden-lion-b6` | H100 (80 GB HBM) | 13.0 | `216.81.245.218:40309` | where the harness was validated |
+
+Rent a multi-GPU box (e.g. B200) per experiment when you need TP / PD-disagg / EP;
+names/IPs are whatever `lium ps` shows.
 
 Current lium pods run without `CAP_SYS_ADMIN`, so in-process
 `unshare(CLONE_NEWNET)` no-egress isolation fails with `EPERM` there. Use
@@ -43,17 +45,17 @@ All from the `sn120` env (`lium` on PATH there):
 
 ```bash
 lium ps                                   # list pods + names + IPs
-lium exec brave-orbit-7c "nvidia-smi -L"  # run a command non-interactively
-lium ssh  brave-orbit-7c                  # interactive shell
-lium rsync brave-orbit-7c ./optima        # push a directory (use for the harness)
-lium scp  brave-orbit-7c ./file /root/    # copy a single file
-lium logs brave-orbit-7c                  # stream logs
-lium rm   brave-orbit-7c                  # TERMINATE (stops billing)
+lium exec <pod> "nvidia-smi -L"  # run a command non-interactively
+lium ssh  <pod>                  # interactive shell
+lium rsync <pod> ./optima        # push a directory (use for the harness)
+lium scp  <pod> ./file /root/    # copy a single file
+lium logs <pod>                  # stream logs
+lium rm   <pod>                  # TERMINATE (stops billing)
 ```
 
 The H100 also answers direct ssh: `ssh root@216.81.245.218 -p 40309 -i ~/.ssh/id_ed25519`.
 
-> Billing: the Blackwell box is ~$4.64/h, the H100 ~$1.48/h. **Tear down idle pods
+> Billing: the H100 is ~$1.48/h; multi-GPU boxes cost more. **Tear down idle pods
 > with `lium rm <name>`** — they bill while RUNNING.
 
 ## Bootstrapping the harness on a fresh pod
@@ -62,10 +64,10 @@ The validated recipe (from the H100; adjust `TORCH_CUDA_ARCH_LIST` per GPU):
 
 ```bash
 # on your machine: push the harness (NOT the sglang clone)
-lium rsync brave-orbit-7c ~/Downloads/github/optima/optima
-lium rsync brave-orbit-7c ~/Downloads/github/optima/examples
+lium rsync <pod> ~/Downloads/github/optima/optima
+lium rsync <pod> ~/Downloads/github/optima/examples
 
-# on the pod (lium ssh, or wrap each in `lium exec brave-orbit-7c "..."`):
+# on the pod (lium ssh, or wrap each in `lium exec <pod> "..."`):
 curl -LsSf https://astral.sh/uv/install.sh | sh
 cd /root/optima && uv venv --python 3.12 .venv && source .venv/bin/activate
 # Latest stable sglang on CUDA 13. --prerelease is needed (0.5.12 depends on the
@@ -79,71 +81,10 @@ echo 'import optima.bootstrap' > "$SP/optima.pth"     # install the seam everywh
 
 export CUDA_HOME=/usr/local/cuda
 export PATH=/usr/local/cuda/bin:$PWD/.venv/bin:$PATH   # sglang JIT needs nvcc + ninja
-export TORCH_CUDA_ARCH_LIST=12.0                       # 12.0 = RTX PRO 6000 Blackwell (sm_120)
-                                                       # 9.0 = H100, 10.0 = B200
+export TORCH_CUDA_ARCH_LIST=9.0                        # set per GPU: 9.0 = H100, 10.0 = B200
 .venv/bin/python -m optima.cli verify   examples/miner_silu_triton --device cuda
 .venv/bin/python -m optima.cli evaluate examples/miner_silu_triton --model Qwen/Qwen2.5-0.5B-Instruct --no-deterministic
 ```
-
-### Blackwell (sm_120) caveats to verify on first run
-
-- sglang / sgl-kernel / flashinfer Blackwell (sm_120) support is **newer** than
-  Hopper — expect possible build/runtime friction; `uv` may resolve a
-  Blackwell-capable sgl-kernel/torch. If `pip install sglang` pulls a Hopper-only
-  build, you may need a CUDA-13 / Blackwell wheel or a source build.
-- GPT-OSS-120B on the Blackwell box is an active native-MXFP4 target under the
-  pinned stack (`sglang==0.5.9`, `torch==2.9.1+cu128`, `flashinfer==0.6.3`).
-  Stock behavior: `moe_runner_backend=auto` selects `flashinfer_mxfp4` but fails
-  weight prep with `assert M % 128 == 0`; forcing `triton_kernel` hits a Triton
-  `ptxas` failure for `sm_120a`; forcing plain `triton` works at TP=4 but OOMs at
-  TP=2 because it expands MXFP4 weights.
-  - Dev-pod result: the `flashinfer_mxfp4` path can be made correct on `sm_120a`.
-    The necessary fixes were: pad GPT-OSS TP shards to FlashInfer's 256-wide
-    shape, use plain packed FP4 weight bytes (no row shuffle), run FlashInfer's
-    `nvfp4_block_scale_interleave` on the MXFP4 block-scale tensors, pass
-    `swizzled_input_sf=False` for the activation scales, and disable PDL for the
-    CUTLASS MoE call. Deterministic component probes moved from `cos ~0.86` to
-    `cos ~0.9999`; TP=4 GPT-OSS output became coherent.
-  - Current measured smoke on the 4× RTX PRO 6000 Blackwell pod, one prompt,
-    64 generated tokens, warmup=1/timed=2: patched `flashinfer_mxfp4` median
-    `46.0 tok/s`; plain Triton fallback median `38.9 tok/s`. Treat this as a
-    promising dev result, not an upstreamed production baseline.
-  - Latest-stack replication (`torch==2.12.0+cu130`,
-    `sglang==0.5.12.post1`, `flashinfer-python==0.6.12`) also works after a
-    smaller SGLang-only patch plus rebuilding `sglang-kernel` `common_ops` for
-    Torch 2.12 / `sm_120a`. The key extra fix was TP=4 GPT-OSS MXFP4 loader
-    padding: ranks receive 736 intermediate values from 32-value block-ceil
-    checkpoint slicing even though SGLang's partition size is 720. Batch-32
-    GPT-OSS-120B TP=4 decode, max-new=64, warmup=1/timed=3, piecewise CUDA graph
-    disabled: the standardized runner passed with patched `flashinfer_mxfp4`
-    median `915.6 tok/s`; plain `triton` median `742.6 tok/s`; speedup `1.23x`.
-    A previous manual run measured `926.7 tok/s` versus `741.6 tok/s`.
-  - Stronger best-stock check: the no-graph Triton number above is not the
-    headline baseline. With CUDA graph enabled, explicit Triton attention,
-    radix cache enabled, and custom all-reduce tested, the best stock SGLang
-    batch-32 result so far is `830.7 tok/s` (`triton` MoE + `triton` attention +
-    CUDA graph + radix). The patched `flashinfer_mxfp4` path under the symmetric
-    CUDA-graph/radix setup measured `1062.4 tok/s` with custom all-reduce enabled,
-    a `1.28x` speedup over the stronger stock baseline. Startup was ~126-129s for
-    these CUDA-graph runs and is reported separately from timed decode throughput.
-  - Long-context sanity: with prompts padded to ~2k tokens and forced 1024-token
-    decode at batch 4, the same best-stock config measured `321.6 tok/s` while
-    patched `flashinfer_mxfp4` measured `402.1 tok/s` (`1.25x`). Both runs found
-    the expected fixed arithmetic answers in all timed iterations.
-  - SGLang-packaged CUDA 13 envs are also viable for dependency hygiene:
-    `uv --torch-backend cu130 --prerelease=allow sglang==0.5.12.post1`
-    resolves to `torch==2.11.0+cu130`, `flashinfer-python==0.6.11.post1`,
-    `sglang-kernel==0.4.2.post2`, and `xgrammar==0.2.0`. Loader smoke and the
-    synthetic SwiGLU probe pass after the candidate patch, but the full
-    `flashinfer_mxfp4` model path currently aborts inside FlashInfer/CUTE
-    RMSNorm with `Expected an MLIR object`. That is the next packaged-stack
-    blocker, separate from the MoE layout fix.
-  - Plain Triton config tuning is not enough: a small fused-MoE config sweep on
-    the GPT-OSS TP=4 shape found only ~1% isolated-kernel movement, and copied
-    B200/RTX configs made the full TP=4 smoke slower than the no-config baseline.
-- For multi-GPU work (the reason for this box): `--tp-size 4` etc. Throughput will
-  be PCIe-comms-bound (no NVLink) — that's expected; the point is exploring the
-  multi-GPU optimization surface (TP/PD/EP), not peak throughput.
 
 ## Clean-signal eval settings
 
@@ -156,73 +97,6 @@ with `optima/.../noise_floor`-style stock-vs-stock runs before trusting a KL num
 
 > Newest first. A running record of what each agent/session actually did, so the
 > next one can resume cold. Candid and concrete — commands, numbers, gotchas.
-
-### 2026-06-01 (later) — MoE block seam: MXFP4 win at forked-backend parity, through SlotSpec (Opus 4.8)
-
-**Box:** 4× RTX PRO 6000 Blackwell (sm120, ~96 GB ea), venv `.venv-sglang-latest-cu130`
-(torch 2.12.0+cu130, sglang 0.5.12.post1, flashinfer 0.6.12, triton_kernels). gpt-oss-120b
-weights cached. Put the venv bin + `/usr/local/cuda/bin` on `PATH` so flashinfer's JIT finds
-`ninja` + `nvcc` (else `FileNotFoundError: ninja`).
-
-**Shipped (branch `feat/moe-block-seam-mxfp4-sm120`):**
-
-1. **`FusedMoE.forward` BLOCK seam** (`dispatch.make_moe_dispatcher` + `integrations/sglang_moe.py`):
-   routing (`topk_output`) is computed upstream, so the seam sits exactly at the expert-forward
-   boundary — the MoE analogue of the `RadixAttention.forward` seam. Eager-only, non-EP, opt-in via
-   `OPTIMA_MOE_SEAM=1`. The registry now carries the miner `prepare` at runtime, and a new SlotSpec
-   `prepare_from_layer` hook maps the live layer → prepare args (the live gpt-oss MoE layer is
-   **dequantized to bf16** by the triton fallback and carries biases — the 2-tensor contract
-   couldn't express that). `OPTIMA_STRICT=1` surfaces kernel errors instead of silent fallback.
-2. **`cosine` correctness mode** (`slots.Correctness` + `verify`): element-wise tolerance is
-   meaningless at ~6–12 % fp4 per-element error; gate on cosine vs the fp32 reference. mxfp4 slot
-   `min_cosine=0.97` (measured floor 0.985; a mis-ordered/broken kernel ≈ 0).
-3. **Real autotuned MXFP4 fused-MoE bundle** (`examples/miner_moe_mxfp4_sm120`, stub overwritten,
-   rebuild.json removed): prepare = de-interleave HF `[gate0,up0,…]` → CUTLASS `[up;gate]`, pad,
-   pack MXFP4, interleave scales, carry biases; forward = MXFP8 act-quant + flashinfer
-   `cutlass_fused_moe`.
-
-**Numbers (gpt-oss-120b, TP=4, batch 32, eager, `gptoss_tp_bench` methodology):**
-- Stock sglang on sm120 is **forced to the triton MoE fallback** — `flashinfer_cutlass`/`_trtllm`/
-  `_mxfp4` all crash (`Mxfp4MoEMethod object has no attribute 'runner'`; cf. flashinfer #2577,
-  sglang MoE "always resolves to Triton on SM120"). triton: **742 eager / 767 graphs**.
-- seam → cutlass MXFP4, **untuned 874 → autotuned 912 median / 922 best**.
-- hand-forked `flashinfer_mxfp4` (the experiment, patches sglang source): **926**.
-- ⇒ the seam **matches the forked backend (~99 %) with NO fork**, +19 % over stock-realizable.
-- Fidelity: cosine 0.985 vs fp32 / 0.999 vs dequant; live output coherent; strict mode confirms
-  every layer ran the kernel (no fallback).
-
-**The autotune gotcha (the entire 874→912 gap):** sglang's startup `_flashinfer_autotune()` only
-profiles the *configured* MoE backend (triton here) — it never sees the injected cutlass call, so
-it ran an untuned default tactic. Fix: tune once per problem shape under `autotune(True)` in the
-kernel, then hit the process-global `AutoTuner` cache. Also: `prepare` OOMs at `mem_fraction 0.85`
-(mxfp4 copies alongside the bf16 weights) — run ~0.65, `del` the padded scratch, `empty_cache()`.
-
-**Running it (matters — the win is config-sensitive):** the lazy first-forward `prepare`
-needs GPU headroom (it pads/quantizes dense bf16 experts while the model is resident). Two
-supported configs, both eager:
-- **eval default** `mem_fraction_static≈0.6` (what `EvalConfig` uses) — works as-is, 912–915 tok/s.
-- **high mem** (`0.85`): set full-eager (`disable_cuda_graph` **and** `disable_piecewise_cuda_graph`
-  — the piecewise-graph buffers otherwise eat the headroom) **and** `OPTIMA_MOE_FREE_DENSE=1`, which
-  reclaims the dense bf16 experts after prepare (the kernel owns its MXFP4 copies). Verified: 920
-  tok/s, no OOM. The production-clean fix (run at any mem) is load-time weight conversion — tracked.
-
-**Codex review of PR #9 — findings + resolutions:**
-1. *P1 live OOM during prepare* — was at `mem_fraction 0.85` **without** the memory settings (GPU
-   ~full → the 1.08 GiB padded-bf16 transient can't allocate). Fixed: `OPTIMA_MOE_FREE_DENSE=1` +
-   full-eager runs at 0.85 (920 tok/s); the eval's 0.6 works without freeing. Memory-lifecycle, not
-   architecture (codex agreed).
-2. *Docs overstated parity* — fair; phrasing now states the config (eager + mem headroom / free-dense)
-   and that parity is 912–920 vs 926.
-3. *Needs eager* — confirmed; `disable_piecewise_cuda_graph` is recommended (and required for
-   free-dense safety: a fallback after freeing would hit empty weights, loudly). Documented.
-4. *pytest missing in the pod venv* — true (uv venv, no pytest/pip); `py_compile`/`compat`/CUDA
-   `verify` all pass. Run the suite with `uv pip install pytest` (or a minimal shim): 63 pass.
-5. *rebuild.py remains an arbitrary-bundle-Python escape hatch* — out of scope here (removed it from
-   THIS bundle); tracked as a separate hardening item (drop `bundle_python` / require vetted
-   repo-local + content-pinned patchers).
-
-**Next:** B200/sm100 (where sglang's FP4 MoE genuinely works + is heavily tuned — the real arena);
-load-time weight conversion (run at any mem_fraction); a CUDA-graph-capturable seam.
 
 ### 2026-06-01 — block slots + attention seam + cu13 / sglang-0.5.12 bring-up (Opus 4.8)
 
@@ -302,7 +176,7 @@ block-slot op-correctness exact (CPU + CUDA, MHA/GQA/MQA). End-to-end on Qwen2.5
   RadixAttention, CUDA graphs, vLLM-V1-style process arch) that **isn't a kernel a miner can
   submit** — the validator owns that as a maintained substrate; miners compete on the kernel slice
   *within* it. Kernel slots are most valuable at the **frontier** (new arch/dtype/hardware where
-  sglang only has a slow fallback — e.g. the sm_120 MoE work in `experiments/`).
+  sglang only has a slow fallback).
 - The seam **is** the backend-swap mechanism: a pinned, *unmodified* sglang patched at runtime, so
   we never fork sglang and every validator runs the same package (consensus). The gitignored
   `sglang/` clone is a dev reference only.
