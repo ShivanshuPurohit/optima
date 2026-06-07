@@ -5,9 +5,10 @@
 - our **baseline** — we score a kernel by its speedup vs sglang's own kernels, so a
   stale baseline means miners optimize against an old frontier (and "wins" may
   already be upstream); and
-- our **runtime** — we patch sglang internals (the `SiluAndMul` / `RMSNorm` seams,
-  `MultiPlatformOp`, the Engine logprob API, specific `ServerArgs` kwargs), so any
-  upgrade can break us.
+- our **runtime** — we patch sglang internals (the `SiluAndMul` / `RMSNorm` op seams,
+  the `RadixAttention.forward` / `FusedMoE.forward` block seams, the
+  `GroupCoordinator.all_reduce` collective seam, `MultiPlatformOp`, the Engine logprob
+  API, specific `ServerArgs` kwargs), so any upgrade can break us.
 
 ## The hard constraint: a pinned version (consensus)
 

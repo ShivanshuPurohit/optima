@@ -9,8 +9,8 @@ per-token **KL** against a reference run, and **task accuracy** on real benchmar
 > full end-to-end explainer: what the validator does, what miners submit, the
 > exact pipeline, how a kernel gets into the model, and the complete threat model
 > (including the "fake the output via an API call" attack and why the op-slot
-> design defeats it). *(Some of its scoring/slot sections predate the benchmark
-> gate and the second slot — this README is the current state of record.)*
+> design defeats it). *(Some of its prose predates the current 7-slot catalog and
+> the first throughput win — this README is the current state of record.)*
 >
 > **Going to production?** [docs/SUBNET_BLUEPRINT.md](docs/SUBNET_BLUEPRINT.md)
 > distills how a real Bittensor subnet (Affine) is built — chain plumbing, the
@@ -19,24 +19,33 @@ per-token **KL** against a reference run, and **task accuracy** on real benchmar
 
 ## What is and isn't done
 
-**Done & validated on a real GPU (H100, sglang 0.5.12.post1 / CUDA 13):** the whole
-*mechanism* — typed op-slots **and fused-*block* slots** (a slot can be one op or a
-whole region behind one typed tensor boundary), the seam that swaps an untrusted
-kernel into a spawned model process, op-correctness, two-launch throughput
-measurement, the KL gate, a real-task capability gate (GSM8K + MMLU), commit-reveal +
-king-of-the-hill scoring, and tamper-resistant timing. Slots: `activation.silu_and_mul`,
-`norm.rmsnorm` (ops) and `attention.sdpa` / `attention.decode` (blocks). The
-**attention-decode swap is proven end-to-end on a live Qwen** — the validator extracts
-the running model's paged KV and routes decode attention to the miner kernel; a
-faithful kernel reproduces the model, a broken one is caught ~20×. Proven on models
-from Qwen2.5-0.5B up to **gpt-oss-120b**, and **scored with CUDA graphs ON + the
-hardware's best attention backend** (auto), never a graphs-off/triton weak baseline.
+**Done & validated on real GPUs (H100, up to gpt-oss-120b; sglang 0.5.12.post1 / CUDA 13):**
+the whole *mechanism* — typed op-slots, fused-*block* slots, **and a cross-GPU *collective*
+slot** (a slot can be one op, a region behind one typed tensor boundary, or a collective
+handed the process group), the seam that swaps an untrusted kernel into a spawned model
+process, op-correctness, two-launch throughput measurement, the KL gate, a real-task
+capability gate (GSM8K + MMLU), commit-reveal + king-of-the-hill scoring, and
+tamper-resistant timing. **Seven slots:** `activation.silu_and_mul`, `norm.rmsnorm` (ops);
+`attention.sdpa` / `attention.decode`, `moe.fused_experts` / `moe.fused_experts_mxfp4`
+(blocks); `collective.all_reduce` (collective, verified distributed). The
+**attention-decode swap is proven end-to-end on a live Qwen** (the validator extracts the
+running model's paged KV and routes decode to the miner kernel; a broken kernel is caught
+~20×), and scoring runs with **CUDA graphs ON + the hardware's best attention backend**,
+never a graphs-off/triton weak baseline.
 
-**Explicitly NOT done:** we have **not improved on base sglang throughput at all**
-— the example kernels are toy demos and are *slower* than sglang's tuned kernels.
-The point so far has been the *referee*, not the optimization. Also open:
-isolation for untrusted miners, chain integration, a real DB, more (bigger) slots
-like attention/MoE, and **eval calibration** (see "Calibration findings").
+**First throughput win — through SlotSpec, no fork.** On 4× RTX PRO 6000 Blackwell (sm120)
+the `moe.fused_experts_mxfp4` bundle routes gpt-oss-120b's experts through the
+`FusedMoE.forward` seam at **~912–922 tok/s (TP=4, batch 32)** — matching the hand-forked
+`flashinfer_mxfp4` backend (~926) while the validator runs **stock pinned sglang**, and
+**+19% over the stock-realizable path** (stock sglang is forced onto the triton MoE fallback
+on sm120). Be honest about what it is: a *route-to-a-faster-existing-path-via-the-seam* win
+on a frontier where stock has only a slow fallback — **not** a novel hand-written kernel
+beating a mature tuned baseline (that's still open). The silu/rmsnorm/attention demos remain
+toy/slow; they prove the contract — the MXFP4 MoE is the first speed win.
+
+**Still open:** a novel kernel beating stock on a mature path, isolation for untrusted
+miners, chain integration, a real DB, the next arena (**B200/sm100**, where sglang's FP4 MoE
+genuinely works and is tuned), and **eval calibration** (see "Calibration findings").
 
 ## Status: validated end-to-end
 
@@ -142,17 +151,21 @@ FP4 MoE genuinely works and is heavily tuned.
 
 ```
 optima/
-  slots.py                  # the op-slot ABI: SlotSpec catalog (silu, rmsnorm)
+  slots.py                  # the slot ABI: SlotSpec catalog (7 slots; kind = op|block|collective)
   manifest.py               # bundle manifest parse + path-safety
   sandbox.py                # static policy scan + isolated load (defense-in-depth)
   registry.py               # kernel registry + eligibility + active toggle
-  dispatch.py               # per-slot dispatchers (the one place a kernel is called)
-  verify.py                 # op-level correctness vs reference
+  dispatch.py               # per-slot dispatchers — silu/rmsnorm/attention/moe/all_reduce
+  verify.py                 # op/block correctness vs HP reference (allclose|matched_ratio|cosine)
+  verify_collective.py      # DISTRIBUTED verify for collective slots (mp-spawn N ranks)
+  rebuild.py                # fenced escape hatch: validator-shipped repo patchers only (no bundle code)
+  compat.py                 # PINNED_SGLANG (0.5.12.post1) + the seam canary (`optima compat`)
   seam.py / bootstrap.py    # install the seam in every venv interpreter via a .pth
   integrations/
-    sglang_silu.py          # patch SiluAndMul
-    sglang_norm.py          # patch RMSNorm
-    sglang_plugin.py        # entry point for sglang builds that have a plugin fw
+    sglang_silu.py / sglang_norm.py        # ops: SiluAndMul, RMSNorm
+    sglang_attention.py / sglang_moe.py    # blocks: RadixAttention.forward, FusedMoE.forward
+    sglang_allreduce.py                    # collective: GroupCoordinator.all_reduce
+    sglang_plugin.py                       # entry point for sglang builds that have a plugin fw
   eval/
     throughput_kl.py        # two-launch throughput + KL (generic corpus; calibration smoke)
     capability.py           # two-launch throughput + KL + benchmark accuracy (the real-task scoring path)
@@ -160,11 +173,15 @@ optima/
     kl.py / prompts.py / _launch.py
   bundle_hash.py            # deterministic bundle identity
   commit_reveal.py          # commit-reveal + king-of-the-hill ledger
-  cli.py                    # slots|scan|verify|evaluate|bench|hash|commit|reveal|ledger|settle
+  cli.py                    # slots|compat|scan|verify|evaluate|bench|hash|commit|reveal|ledger|settle
 examples/
-  miner_silu_triton|torch|broken/      # silu slot (faithful / CPU dry-run / adversarial)
-  miner_rmsnorm_triton|broken/         # rmsnorm slot (faithful / adversarial)
-tests/                                  # 21 tests (scanner, manifest, KL, commit-reveal, verify)
+  miner_silu_{triton,torch,broken,sparse}/     # silu slot (faithful / CPU dry-run / adversarial / sparse)
+  miner_rmsnorm_{triton,broken}/               # rmsnorm slot (faithful / adversarial)
+  miner_attention_torch/ miner_attention_decode_torch/   # attention.sdpa / attention.decode (blocks)
+  miner_moe_fused_experts_torch/               # moe.fused_experts (block)
+  miner_moe_mxfp4_sm120/                       # moe.fused_experts_mxfp4 — the sm120 throughput win
+  miner_allreduce_torch/                       # collective.all_reduce
+tests/                                  # 75 tests (scanner, manifest, KL, verify, block/moe seams, collective, rebuild, commit-reveal)
 ```
 
 ## How a kernel gets into the model (the seam)
@@ -172,10 +189,12 @@ tests/                                  # 21 tests (scanner, manifest, KL, commi
 `sglang.Engine` forces `mp.set_start_method("spawn")` and runs the model in a
 separate scheduler process, so a class-patch in the parent never reaches it. We
 install the seam in **every** venv interpreter via a `.pth` file
-(`import optima.bootstrap`) + a post-import hook that patches the target op
-(`SiluAndMul` / `RMSNorm`) the moment its module loads — including in the spawned
-scheduler. Released sglang 0.5.9 has no plugin framework, so this `.pth` path is
-primary; the entry-point plugin is kept for builds that do.
+(`import optima.bootstrap`) + a post-import hook that patches the target chokepoint the
+moment its module loads — including in the spawned scheduler. Five chokepoints today:
+`SiluAndMul` / `RMSNorm` (ops), `RadixAttention.forward` / `FusedMoE.forward` (blocks),
+and `GroupCoordinator.all_reduce` (collective). The pinned sglang (0.5.12.post1, see
+`optima/compat.py`) has no stable plugin framework, so this `.pth` path is primary; the
+entry-point plugin is kept for builds that do.
 
 The validator does **two launches** of the same model (identical weights/seed):
 baseline (`OPTIMA_ACTIVE=0`, stock kernels) and candidate (`OPTIMA_ACTIVE=1`,
@@ -234,11 +253,13 @@ A bundle is a directory: `manifest.toml` (data — which slots, where the source
 + kernel **source** + optional eligibility `metadata/`. The miner provides only the
 slot's `entry` callable; the **validator** allocates outputs, owns the dispatch and
 fallback, and does the registration. Adding a slot is a validator action in
-`optima/slots.py` (+ a seam patch). A slot's `kind` is `op` (one fused op) or `block`
-(a region of several ops behind one typed boundary); correctness is `allclose` for
-bit-faithful ops or `matched_ratio` (≥ρ of elements within tol vs high-precision
-ground truth) for kernels that legitimately differ (attention/fp8/absorbed). Four
-slots today:
+`optima/slots.py` (+ a seam patch). A slot's `kind` is `op` (one fused op), `block`
+(a region of several ops behind one typed boundary), or `collective` (a cross-GPU reduce —
+handed the process group, verified distributed). Correctness is `allclose` for bit-faithful
+ops, `matched_ratio` (≥ρ of elements within tol vs high-precision ground truth) for kernels
+that legitimately differ (attention/fp8/absorbed), or `cosine` (vs the HP reference) for
+low-bit kernels where element-wise tolerance is meaningless (MXFP4/MXFP8). **Seven slots
+today:**
 
 - `activation.silu_and_mul` — `entry(x, out)` — Qwen/Llama-class MLP (op).
 - `norm.rmsnorm` — `entry(x, weight, out, eps)` — universal; fires on gpt-oss (op).
@@ -247,6 +268,15 @@ slots today:
 - `attention.decode` — `entry(q, k, v, seq_lens, sm_scale, out)` — paged-decode
   attention; the seam extracts the running model's paged KV and routes decode through
   it (block; eager-only gather MVP — a paged-direct, CUDA-graph-safe contract is next).
+- `moe.fused_experts` — `(prepare, forward)` pair — SwiGLU fused experts; `prepare` owns
+  the weight layout once at load, `forward(x, topk_ids, topk_weights, prepared, out)` runs
+  per step (block).
+- `moe.fused_experts_mxfp4` — the MXFP4 variant that **is the sm120 throughput win**:
+  `prepare` repacks/interleaves MXFP4 weights+scales, `forward` MXFP8-quantizes and calls
+  CUTLASS fused-MoE; gated by `cosine` (block).
+- `collective.all_reduce` — `entry(x, out, group)` — TP all-reduce (the comms waist); the
+  validator owns the buffer + the process group; verified distributed vs the fp32
+  cross-rank sum (`optima.verify_collective`).
 
 ## Anti-copy & scoring: commit-reveal + king of the hill
 
@@ -299,8 +329,8 @@ cross-validator consensus catches a rogue validator.
 
 | Concern | Now | Production |
 |---|---|---|
-| Slots | silu, rmsnorm (toy kernels) | + attention/MLA, MoE, GEMM (real wins) |
-| Throughput gain | **none yet** | the actual point — real faster kernels |
+| Slots | 7: silu/rmsnorm, attention.sdpa/decode, MoE(+MXFP4), all-reduce | + MLA, GEMM, comms-overlap blocks |
+| Throughput gain | **first win: sm120 MXFP4 MoE (seam ties the forked backend)** | novel kernels beating mature tuned baselines |
 | Model | up to gpt-oss-120b (1 GPU) | DSV4-scale (multi-GPU, TP/PD/EP) |
 | Quality gate | KL + GSM8K/MMLU on real prompts, **uncalibrated** | noise-floor KL + large-n benchmarks + det mode |
 | Isolation | scan + in-proc load | namespaces + no-egress + per-eval ctx + watchdog |
@@ -310,8 +340,11 @@ cross-validator consensus catches a rogue validator.
 ## Adding a slot
 
 1. Define a `SlotSpec` in `optima/slots.py` (`make_inputs`, `invoke_reference`,
-   `invoke_entry`, `out_shape`, tolerances).
-2. Add a seam patch under `optima/integrations/` that routes the real sglang op
-   through a dispatcher built with `make_*_dispatcher`, and install it from
-   `seam.activate()`; add the op's module to `bootstrap._TARGETS`.
-3. Miners target the new slot by name in their manifest.
+   `invoke_entry`, `out_shapes`, a `Correctness` mode, tolerances). It must satisfy the
+   four invariants in [docs/SLOT_CONTRACT.md](docs/SLOT_CONTRACT.md); if it can't, it
+   belongs in the fenced escape hatch (`rebuild.py`), not the core.
+2. Add a seam patch under `optima/integrations/` that routes the real sglang chokepoint
+   through a dispatcher built with `make_*_dispatcher`, install it from `seam.activate()`,
+   and add the module to `bootstrap._TARGETS`; add a canary line in `optima/compat.py`.
+3. Miners target the new slot by name in their manifest. (A `collective` slot is verified
+   with `optima.verify_collective`, not `verify_entry` — see the contract doc.)

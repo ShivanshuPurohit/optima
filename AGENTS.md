@@ -41,12 +41,14 @@ This repo is the **validator harness** (the referee), plus example miner bundles
 - **Mechanism: done & validated on real GPUs** (H100, up to gpt-oss-120b). Typed
   op-slots, the `.pth`+post-import seam, op-correctness, two-launch throughput+KL,
   a GSM8K capability gate, commit-reveal + king-of-the-hill, tamper-resistant
-  timing. A slot is a single **op** *or* a fused **block** (same cheat-resistant
-  contract — validator allocates outputs, miner fills them, the kernel never reaches
-  the sampler — just a wider boundary): `activation.silu_and_mul`, `norm.rmsnorm`
-  (ops); `attention.sdpa`/`attention.decode` (blocks via the `RadixAttention.forward`
-  seam, `OPTIMA_ATTENTION_SEAM=1`); and `moe.fused_experts` / `moe.fused_experts_mxfp4`
-  (blocks via the `FusedMoE.forward` seam, `OPTIMA_MOE_SEAM=1`).
+  timing. A slot is a single **op**, a fused **block**, *or* a cross-GPU **collective**
+  (same cheat-resistant contract — validator allocates outputs, miner fills them, the
+  kernel never reaches the sampler — just a wider boundary): `activation.silu_and_mul`,
+  `norm.rmsnorm` (ops); `attention.sdpa`/`attention.decode` (blocks via the
+  `RadixAttention.forward` seam, `OPTIMA_ATTENTION_SEAM=1`); `moe.fused_experts` /
+  `moe.fused_experts_mxfp4` (blocks via the `FusedMoE.forward` seam, `OPTIMA_MOE_SEAM=1`);
+  and `collective.all_reduce` (the TP comms waist, via the `GroupCoordinator.all_reduce`
+  seam, `OPTIMA_COLLECTIVE_SEAM=1` — verified distributed by `optima.verify_collective`).
 - **First real throughput win — through SlotSpec, on real GPUs.** On 4× RTX PRO 6000
   Blackwell (sm120), the `moe.fused_experts_mxfp4` bundle (MXFP4 cutlass fused-MoE,
   autotuned) routes gpt-oss-120b's experts through the seam at **~912–922 tok/s, TP=4
@@ -59,11 +61,13 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   Run **eager** with mem headroom for the first-forward `prepare` (eval uses `mem≈0.6`; or `0.85`
   + `disable_piecewise_cuda_graph` + `OPTIMA_MOE_FREE_DENSE=1`, which frees the dense bf16 experts).
   **Next arena: B200/sm100**, where sglang's FP4 MoE genuinely works and is heavily tuned.
-- **Open:** isolation for untrusted miners, chain integration, a real DB, bigger
-  slots (attention/MLA, MoE), and **eval calibration** (KL threshold = k× the
-  measured nondeterminism noise floor; run with `enable_deterministic_inference`;
-  benchmark accuracy needs large n). RMSNorm was chosen as the second slot because
-  it is simple and universal, not because it is expected to be a major speed win.
+- **Open:** a novel kernel beating a *mature* tuned baseline (the MXFP4 win ties a
+  forked backend on a frontier where stock only has a slow fallback — not the same as
+  beating a tuned path), isolation for untrusted miners, chain integration, a real DB,
+  bigger slots (MLA/weight-absorbed attention, FP8/FP4 GEMM, comms-overlap blocks that
+  own their trailing reduce), and **eval calibration** (KL threshold = k× the measured
+  nondeterminism noise floor; run with `enable_deterministic_inference`; benchmark
+  accuracy needs large n).
 
 ## How to run
 
