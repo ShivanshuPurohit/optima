@@ -117,23 +117,13 @@ class Champion:
     round_id: int
 
 
-@dataclass
-class ChampionChange:
-    """One throne change, appended to the ledger's champion history (audit trail)."""
-    content_hash: str
-    hotkey: str
-    score: float
-    round_id: int
-    from_hotkey: Optional[str] = None
-
-
 @dataclass(frozen=True)
 class EvalRecord:
-    """The full, typed result of evaluating one bundle — the canonical eval record:
-    the audit row, the dedup key, and what a dashboard reads. ``score`` / ``passed`` /
-    ``mean_kl`` mirror the king-of-the-hill ``Score`` atom; the remaining fields carry
-    the fidelity + provenance detail that a bare score throws away. The ledger keys
-    these by ``(hotkey, bundle_hash)`` so an already-scored submission is never re-run.
+    """The typed result of evaluating one bundle — the audit row and the dedup key.
+    ``score`` / ``passed`` / ``mean_kl`` mirror the king-of-the-hill ``Score`` atom; the
+    rest is the fidelity detail an eval actually produces. Keyed in the ledger by
+    ``(hotkey, bundle_hash)`` so an already-scored submission is never re-run. Add a
+    field when a producer needs it — ``schema_version`` + the tolerant load make that safe.
     """
     hotkey: str
     bundle_hash: str
@@ -142,22 +132,9 @@ class EvalRecord:
     score: float
     passed: bool
     throughput: float = 0.0
-    baseline_throughput: float = 0.0
     mean_kl: float = 0.0
-    p99_kl: float = 0.0
-    argmax_rate: float = 0.0
     gsm8k_acc: float = -1.0  # -1 = not measured
     dq_reason: str = ""
-    uid: int = -1
-    block: int = 0           # chain block of the eval (0 until chain integration)
-    ts: float = 0.0          # caller-supplied wall-clock; 0 = unset (kept out of logic)
-    per_prompt: tuple = ()
-
-
-def _eval_from_dict(d: dict) -> EvalRecord:
-    fields = _only_fields(EvalRecord, d)
-    fields["per_prompt"] = tuple(fields.get("per_prompt", ()))
-    return EvalRecord(**fields)
 
 
 @dataclass
@@ -180,7 +157,6 @@ class Ledger:
         self.scores: list[Score] = []
         self.evals: dict[str, EvalRecord] = {}
         self.champion: Optional[Champion] = None
-        self.champion_history: list[ChampionChange] = []
         self._seq = 0
 
     # ---- persistence ----
@@ -207,10 +183,7 @@ class Ledger:
         led.commitments = [Commitment(**_only_fields(Commitment, c)) for c in data.get("commitments", [])]
         led.reveals = [Reveal(**_only_fields(Reveal, r)) for r in data.get("reveals", [])]
         led.scores = [Score(**_only_fields(Score, s)) for s in data.get("scores", [])]
-        led.evals = {k: _eval_from_dict(v) for k, v in data.get("evals", {}).items()}
-        led.champion_history = [
-            ChampionChange(**_only_fields(ChampionChange, h)) for h in data.get("champion_history", [])
-        ]
+        led.evals = {k: EvalRecord(**_only_fields(EvalRecord, v)) for k, v in data.get("evals", {}).items()}
         champ = data.get("champion")
         led.champion = Champion(**_only_fields(Champion, champ)) if champ else None
         led._seq = data.get("seq", len(led.commitments))
@@ -224,7 +197,6 @@ class Ledger:
             "scores": [asdict(s) for s in self.scores],
             "evals": {k: asdict(v) for k, v in self.evals.items()},
             "champion": asdict(self.champion) if self.champion else None,
-            "champion_history": [asdict(h) for h in self.champion_history],
             "seq": self._seq,
         }
         _atomic_write_json(Path(path), data)
@@ -321,7 +293,6 @@ class Ledger:
         title_changed = False
         threshold = (self.champion.score * (1.0 + margin)) if self.champion else (1.0 + margin)
         if challenger is not None and challenger_score >= threshold:
-            from_hotkey = self.champion.hotkey if self.champion else None
             self.champion = Champion(
                 content_hash=challenger.content_hash,
                 hotkey=challenger.hotkey,
@@ -329,13 +300,6 @@ class Ledger:
                 round_id=round_id,
             )
             title_changed = True
-            self.champion_history.append(ChampionChange(
-                content_hash=challenger.content_hash,
-                hotkey=challenger.hotkey,
-                score=challenger.score,
-                round_id=round_id,
-                from_hotkey=from_hotkey,
-            ))
 
         weights = {self.champion.hotkey: 1.0} if self.champion else {}
         return SettleResult(

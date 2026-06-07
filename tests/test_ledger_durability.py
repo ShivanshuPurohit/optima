@@ -1,4 +1,4 @@
-"""Ledger durability, eval records, dedup, and champion history — pure, no GPU."""
+"""Ledger durability, eval records, and dedup — pure, no GPU."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from optima.commit_reveal import EvalRecord, Ledger, SCHEMA_VERSION, make_commitment
+from optima.commit_reveal import EvalRecord, Ledger, SCHEMA_VERSION
 
 
 def _eval(hotkey: str = "alice", bundle_hash: str = "h1", **kw) -> EvalRecord:
@@ -15,14 +15,6 @@ def _eval(hotkey: str = "alice", bundle_hash: str = "h1", **kw) -> EvalRecord:
                 round_id=0, score=1.1, passed=True, mean_kl=1e-4)
     base.update(kw)
     return EvalRecord(**base)
-
-
-def _submit(led: Ledger, hotkey: str, content_hash: str, round_id: int,
-            score: float, salt: str = "s") -> None:
-    """Full commit -> reveal (original) -> score for one hotkey."""
-    led.commit(hotkey, make_commitment(content_hash, hotkey, salt), round_id)
-    led.reveal(hotkey, content_hash, salt, round_id)
-    led.record_score(hotkey, content_hash, round_id, score, 1e-4, True)
 
 
 # ---- atomic write + round-trip ----
@@ -47,7 +39,7 @@ def test_save_load_roundtrip(tmp_path: Path):
     assert len(back.commitments) == 1
     assert back.is_known("alice", "h1")
     rec = back.eval_for("alice", "h1")
-    assert rec.score == 1.1 and rec.per_prompt == ()
+    assert rec.score == 1.1 and rec.mean_kl == 1e-4
 
 
 def test_schema_version_is_written(tmp_path: Path):
@@ -127,34 +119,4 @@ def test_load_defaults_missing_optional_fields(tmp_path: Path):
         "champion": None, "champion_history": [], "seq": 0,
     }))
     rec = Ledger.load(p).eval_for("a", "h1")
-    assert rec.mean_kl == 0.0 and rec.gsm8k_acc == -1.0 and rec.block == 0
-
-
-# ---- champion history (audit trail of throne changes) ----
-
-def test_champion_history_tracks_throne_changes():
-    led = Ledger()
-    _submit(led, "alice", "ha", 0, score=1.10)
-    assert led.settle(0).title_changed
-    assert [h.hotkey for h in led.champion_history] == ["alice"]
-    assert led.champion_history[0].from_hotkey is None
-
-    _submit(led, "bob", "hb", 1, score=2.00)  # clears alice * 1.02
-    assert led.settle(1).title_changed
-    assert [h.hotkey for h in led.champion_history] == ["alice", "bob"]
-    assert led.champion_history[1].from_hotkey == "alice"
-
-    _submit(led, "carol", "hc", 2, score=2.00)  # ties bob, below margin -> no change
-    assert not led.settle(2).title_changed
-    assert len(led.champion_history) == 2
-
-
-def test_champion_history_persists(tmp_path: Path):
-    p = tmp_path / "ledger.json"
-    led = Ledger()
-    _submit(led, "alice", "ha", 0, score=1.10)
-    led.settle(0)
-    led.save(p)
-    back = Ledger.load(p)
-    assert len(back.champion_history) == 1
-    assert back.champion_history[0].hotkey == "alice"
+    assert rec.mean_kl == 0.0 and rec.gsm8k_acc == -1.0

@@ -90,26 +90,13 @@ def connect(network: str = "finney"):
     return bt.Subtensor(network=network)
 
 
-def _block_hash(subtensor, block: int) -> str:
-    """Best-effort block hash for prompt seeding. Falls back to the block number (still
-    consensus-deterministic) if the SDK exposes no hash accessor."""
-    for name in ("get_block_hash", "block_hash"):
-        fn = getattr(subtensor, name, None)
-        if callable(fn):
-            try:
-                return str(fn(block))
-            except Exception:  # noqa: BLE001
-                pass
-    return str(block)
-
-
 def fetch_metagraph(subtensor, netuid: int) -> MetagraphView:
     mg = subtensor.metagraph(netuid=netuid)
     block = int(subtensor.get_current_block())
     return MetagraphView(
         netuid=netuid,
         block=block,
-        block_hash=_block_hash(subtensor, block),
+        block_hash=str(subtensor.get_block_hash(block)),  # chain-compat pins get_block_hash
         uids=[int(u) for u in mg.uids],
         hotkeys=list(mg.hotkeys),
         validator_permit=[bool(p) for p in getattr(mg, "validator_permit", [])],
