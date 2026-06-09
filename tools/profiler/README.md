@@ -74,6 +74,69 @@ bound-types** (per-kernel table) · **Kernel explorer** (search/sort every top
 kernel) · **Config levers** (CUDA-graph / MTP / all-reduce / ceiling) ·
 **Artifact health**.
 
+## Workflow: how this fits the loop
+
+This tool is the **analysis** half. The **capture** half is
+`experiments/qwen35/pod_scripts/` (`profile_run.sh` on the GPU box →
+`mac_pull.sh` down). They're designed to fit: `profile_run.sh` produces exactly
+the artifacts this tool ingests. The loop is always the same:
+
+```
+capture on pod  →  pull to Mac  →  build.py <dir>  →  open report.html
+```
+
+### A) New model on a new pod (e.g. Nemotron)
+
+1. **Capture** with `pod_scripts/profile_run.sh` (the V2 driver): point it at the
+   new model + serve args, and edit its **ncu kernel battery** to match the new
+   model's kernel names. Keep capture **labels** consistent — the analyzer reads
+   regime/batch from them: a label containing `prefill` → prefill regime;
+   `b32`/`b1` → that batch. (So `ncu_fp4gemm_b32`, `ncu_prefill`, etc.)
+2. **Pull** with `mac_pull.sh` → `~/Downloads/.../profiles_nemotron`.
+3. **Teach it the new kernels** — the only model-specific step: add regexes to
+   `KERNEL_CATS` in `ingest.py` for the new model's kernels (Mamba-2 SSD, NVFP4
+   LatentMoE, etc.). Everything downstream (findings, dashboard) adapts.
+4. **Analyze**: `python3 tools/profiler/build.py ~/Downloads/.../profiles_nemotron
+   -o nemotron_out` → open `nemotron_out/report.html`. You immediately get the
+   winnable surface, the vendor floors, the Amdahl ceiling, and the config levers.
+
+### B) Measuring your OWN fused kernels (the win/no-win question)
+
+The honest question for a patch is **baseline vs patched**, so capture two
+datasets and compare:
+
+```bash
+# baseline
+profile_run.sh all                         # -> profiles_base/
+# with your seam/kernel active (see AGENTS.md OPTIMA_*_SEAM env vars)
+OPTIMA_MOE_SEAM=1 profile_run.sh all        # -> profiles_patched/
+build.py profiles_base    -o out_base
+build.py profiles_patched -o out_patched
+```
+
+Then the **discipline loop** (ceiling-gate → ncu-confirm → rewrite → e2e-prove)
+maps onto the two reports:
+
+- **Before you write the kernel** — `out_base/report.html` tells you whether the
+  target is worth it: its **decode share** (Amdahl — is the ceiling more than
+  noise?) and its **ncu bound-type** (latency-bound = fusable; memory/compute
+  floor = don't bother).
+- **After you write it** — `out_patched` should show three things move together:
+  (1) the glue category's **launch count drops** (you eliminated a kernel
+  boundary), (2) its **decode share shrinks**, (3) **e2e tok/s rises**. If decode
+  share didn't move or e2e didn't rise → it's a phantom win. Discard it.
+
+**On the nsys-only box (no ncu):** the tool still works — categories just read
+"unknown / PROFILE IT" instead of a bound-type. That's fine for *proving* a
+fusion: ncu is for *deciding where to fuse* (diagnose the bound-type once, on an
+ncu box); nsys + e2e + the kernel-launch-count drop is enough to *prove the
+fusion worked*. So: diagnose bound-types on an ncu box once per model, then
+iterate on patches against the nsys-only box using e2e + launch counts.
+
+> A dedicated `compare.py` (two `dataset.json` → side-by-side deltas: e2e peak,
+> per-category share, launch counts, bound-type changes) is the natural next
+> addition for scenario B — not built yet.
+
 ## Extending to a new model
 
 The kernel taxonomy is a config: `KERNEL_CATS` (regex → category) and `DISPLAY`
