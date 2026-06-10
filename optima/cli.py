@@ -24,7 +24,7 @@ import json
 import sys
 
 from optima.manifest import load_manifest, resolve_source
-from optima.sandbox import load_entry, scan_path
+from optima.sandbox import scan_path
 
 
 def _json_obj(raw: str | None) -> dict:
@@ -147,10 +147,15 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 rc = 2
             continue
 
-        entry = load_entry(src, op.entry)  # SECURITY: isolate in production
-        prepare_fn = load_entry(src, op.prepare) if op.prepare else None  # (prepare, forward) slots
-        result = verify_entry(
-            slot, entry, prepare=prepare_fn, dtype=_dtype(args.dtype), device=args.device, seed=args.seed
+        # Load + run the miner kernel in a FRESH spawned process, so THIS trusted CLI
+        # process never imports miner code (no in-process RCE sink). Production must also
+        # namespace/no-egress that child; this removes the trusted-process execution.
+        from optima.eval._launch import call_in_subprocess
+        from optima.verify import verify_entry_from_source
+
+        result = call_in_subprocess(
+            verify_entry_from_source, op.slot, str(src), op.entry,
+            prepare_name=op.prepare, dtype_name=args.dtype, device=args.device, seed=args.seed,
         )
         print(format_verify(result))
         if not result.passed:

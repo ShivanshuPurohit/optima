@@ -182,6 +182,32 @@ def verify_entry(
     )
 
 
+def verify_entry_from_source(
+    slot_name: str,
+    source_path: str,
+    entry_name: str,
+    *,
+    prepare_name: Optional[str] = None,
+    dtype_name: str = "bfloat16",
+    device: Optional[str] = None,
+    seed: int = 0,
+    shapes: Optional[list[dict]] = None,
+) -> VerifyResult:
+    """Load the miner module and verify it — module-level + picklable so the CLI can run
+    it via ``call_in_subprocess`` in a FRESH process. This keeps the trusted validator/CLI
+    process from ever importing miner code (import-time payloads + the kernel run only in the
+    throwaway child). It is NOT a security boundary by itself — production still needs the
+    child namespaced/no-egress — but it removes the in-process-RCE-in-the-CLI sink (#6)."""
+    from optima.sandbox import load_entry
+    from optima.slots import get_slot
+
+    slot = get_slot(slot_name)
+    dtype = getattr(torch, dtype_name)
+    entry = load_entry(source_path, entry_name)  # runs the miner module body — in THIS child
+    prepare = load_entry(source_path, prepare_name) if prepare_name else None
+    return verify_entry(slot, entry, prepare=prepare, dtype=dtype, device=device, seed=seed, shapes=shapes)
+
+
 def _name(dtype: torch.dtype) -> str:
     return str(dtype).replace("torch.", "")
 

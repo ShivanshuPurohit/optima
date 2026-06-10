@@ -102,7 +102,12 @@ def _generate_and_time(engine, prompts: list[str], *, max_new_tokens: int, timed
         elapsed = time.perf_counter() - t0
         if isinstance(outs, dict):
             outs = [outs]
-        tokens = sum(int(o.get("meta_info", {}).get("completion_tokens", 0)) for o in outs)
+        # Numerator: under ignore_eos the driver knows the count a priori (fixed budget),
+        # so don't trust the scheduler-reported completion_tokens (#11).
+        if getattr(cfg, "ignore_eos", False):
+            tokens = len(prompts) * int(max_new_tokens)
+        else:
+            tokens = sum(int(o.get("meta_info", {}).get("completion_tokens", 0)) for o in outs)
         if elapsed > 0:
             samples.append(tokens / elapsed)
         outputs = outs  # keep last for answer-checking + KL
@@ -197,6 +202,7 @@ def evaluate_capability(
         kl_threshold=cfg.kl_threshold,
         p99_kl_threshold=cfg.p99_kl_threshold,
         argmax_disagree_rate_threshold=cfg.argmax_disagree_rate_threshold,
+        coverage_dev_threshold=getattr(cfg, "coverage_dev_threshold", None),
     )
 
     baseline_reads = [base_tok_s] + ([base2_tok_s] if base2_tok_s > 0 else [])

@@ -61,6 +61,11 @@ class EvalConfig:
     #   in deterministic mode a faithful kernel sits at 0 flips (see README).
     argmax_disagree_rate_threshold: Optional[float] = 0.01
     p99_kl_threshold: Optional[float] = None  # opt-in (needs per-model calibration)
+    # Tail-mass guard: top-k KL is blind to mass moved into the unreported tail, so a
+    # flattened/diversity-collapsed candidate with a matching head passes it. mean
+    # coverage deviation catches that. Loose default (faithful kernels sit ~0); tighten
+    # per model. None -> off.
+    coverage_dev_threshold: Optional[float] = 0.25
     # FRAMEWORK MODE: when the miner may patch the engine (a setup() callable), its
     # self-reported logprobs are NOT trustworthy, so the quality gate switches from
     # in-process KL to TOKEN-MATCH vs the trusted stock baseline — the candidate's
@@ -185,8 +190,20 @@ def _timed_generate(engine, prompts: list[str], cfg: EvalConfig, *, with_logprob
     elapsed = time.perf_counter() - t0
     if isinstance(outputs, dict):
         outputs = [outputs]
-    tokens = sum(int(o.get("meta_info", {}).get("completion_tokens", 0)) for o in outputs)
+    tokens = _counted_tokens(outputs, prompts, cfg)
     return outputs, tokens, elapsed
+
+
+def _counted_tokens(outputs, prompts, cfg) -> int:
+    """The throughput numerator. The token COUNT is produced in the scheduler process
+    where the miner kernel also runs, so it isn't trustworthy on its own. Under the
+    scoring default (ignore_eos + a fixed max_new_tokens) the driver knows the count a
+    PRIORI — ``len(prompts) * max_new_tokens`` — so we use that and never trust a
+    scheduler-reported field. Only when natural-length generation is explicitly
+    requested (--no-ignore-eos) do we fall back to the reported completion_tokens."""
+    if getattr(cfg, "ignore_eos", False):
+        return len(prompts) * int(cfg.max_new_tokens)
+    return sum(int(o.get("meta_info", {}).get("completion_tokens", 0)) for o in outputs)
 
 
 def _measure(engine, prompts: list[str], cfg: EvalConfig) -> ModeResult:
@@ -282,6 +299,7 @@ def evaluate(cfg: EvalConfig, bundle_path: str, prompts: Optional[list[str]] = N
             kl_threshold=cfg.kl_threshold,
             p99_kl_threshold=cfg.p99_kl_threshold,
             argmax_disagree_rate_threshold=cfg.argmax_disagree_rate_threshold,
+            coverage_dev_threshold=cfg.coverage_dev_threshold,
         )
     # Crownable only when quality holds AND the speedup is a noise-confident real win.
     # The ledger records the speedup only when crownable, else 0.0 — so a cheat (quality
