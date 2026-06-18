@@ -57,11 +57,28 @@ def cmd_slots(_: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_compat(_: argparse.Namespace) -> int:
+def cmd_arenas(_: argparse.Namespace) -> int:
+    from optima.arenas import ARENAS, list_arenas
+
+    print("Arenas (model -> sglang pin / image / seam subset / per-model KL floors):")
+    for name in list_arenas():
+        a = ARENAS[name]
+        seams = ",".join(a.seam_adapters) or "all"
+        floors = a.kl_floors or "(slot defaults)"
+        print(f"  {name}  model={a.model_path or 'any'}  sglang={a.sglang_version}  "
+              f"image={a.docker_image or '-'}")
+        print(f"      seams={seams}  kl_floors={floors}" + (f"  — {a.notes}" if a.notes else ""))
+    return 0
+
+
+def cmd_compat(args: argparse.Namespace) -> int:
+    from optima.arenas import get_arena
     from optima.compat import format_checks, run_checks
 
-    checks = run_checks()
-    print("sglang compatibility canary (run after any sglang bump):")
+    arena = get_arena(getattr(args, "arena", None))
+    checks = run_checks(arena)
+    print(f"sglang compatibility canary for arena {arena.name!r} "
+          f"(pin {arena.sglang_version}; run after any sglang bump):")
     print(format_checks(checks))
     return 0 if all(c.ok for c in checks) else 2
 
@@ -190,12 +207,19 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         print("no known slots in this bundle; nothing to evaluate")
         return 1
 
-    # Per-slot calibrated KL threshold (e.g. attention's higher floor) overrides the generic
-    # default unless KL is advisory; the user's explicit --kl-threshold still applies as the
-    # fallback for slots without a calibrated value.
+    # KL gate resolution (most-specific wins, unless --kl-advisory): the ARENA's per-model
+    # calibrated floor > the slot's model-agnostic default (SlotSpec.kl_threshold) > the
+    # CLI --kl-threshold. The arena also supplies the model's base engine kwargs.
+    from optima.arenas import get_arena
     from optima.slots import get_slot as _get_slot
-    _slot_kl = _get_slot(m.ops[0].slot).kl_threshold
-    _kl_threshold = None if args.kl_advisory else (_slot_kl if _slot_kl is not None else args.kl_threshold)
+    _arena = get_arena(getattr(args, "arena", None))
+    _slot_name = m.ops[0].slot
+    _arena_kl = _arena.kl_floor_for(_slot_name)
+    _slot_kl = _get_slot(_slot_name).kl_threshold
+    _kl_threshold = (None if args.kl_advisory
+                     else _arena_kl if _arena_kl is not None
+                     else _slot_kl if _slot_kl is not None
+                     else args.kl_threshold)
 
     cfg = EvalConfig(
         model_path=args.model,
@@ -224,11 +248,14 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         candidate_attention_backend=args.candidate_attention_backend,
         candidate_moe_runner_backend=args.candidate_moe_runner_backend,
         candidate_disable_custom_all_reduce=args.candidate_disable_custom_all_reduce,
-        extra_engine_kwargs=_json_obj(args.engine_kwargs_json),
+        extra_engine_kwargs={**_arena.engine_kwargs, **_json_obj(args.engine_kwargs_json)},
         candidate_extra_engine_kwargs=_json_obj(args.candidate_engine_kwargs_json),
     )
-    if _slot_kl is not None and not args.kl_advisory:
-        print(f"  (using {m.ops[0].slot}'s calibrated KL threshold {_slot_kl:g})")
+    if _arena.name != "default":
+        print(f"  (arena {_arena.name!r}: model={_arena.model_path or 'any'}, sglang={_arena.sglang_version})")
+    if _kl_threshold is not None and not args.kl_advisory and _kl_threshold != args.kl_threshold:
+        _src = "arena" if _arena_kl is not None else "slot"
+        print(f"  (KL gate {_kl_threshold:g} from {_src} calibration for {_slot_name})")
     print(f"\nrunning two launches of {args.model} (dtype={args.dtype}, "
           f"deterministic={cfg.deterministic}, cuda_graph={not cfg.disable_cuda_graph}, "
           f"attn_backend={cfg.attention_backend or 'auto'}, "
@@ -266,15 +293,15 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     if getattr(args, "ledger", None) and getattr(args, "hotkey", None):
         from optima.bundle_hash import content_hash
         from optima.commit_reveal import Ledger
-        from optima.compat import PINNED_SGLANG
 
         ch = content_hash(args.bundle)
         led = Ledger.load(args.ledger)
         led.record_score(args.hotkey, ch, args.round, report.score, report.kl.mean_kl,
-                         report.passed_quality, sglang_version=PINNED_SGLANG, slot=m.ops[0].slot)
+                         report.passed_quality, sglang_version=_arena.sglang_version,
+                         slot=_slot_name, arena=_arena.name)
         led.save(args.ledger)
         print(f"recorded -> {args.ledger} (hotkey={args.hotkey}, round={args.round}, "
-              f"slot={m.ops[0].slot}, sglang={PINNED_SGLANG})")
+              f"arena={_arena.name}, slot={_slot_name}, sglang={_arena.sglang_version})")
     return 0 if report.passed_quality else 3
 
 
@@ -300,9 +327,18 @@ def cmd_bench(args: argparse.Namespace) -> int:
         print("no known slots in this bundle; nothing to evaluate")
         return 1
 
+    from optima.arenas import get_arena
     from optima.slots import get_slot as _get_slot
-    _slot_kl = _get_slot(m.ops[0].slot).kl_threshold
-    _kl_threshold = None if args.kl_advisory else (_slot_kl if _slot_kl is not None else args.kl_threshold)
+    _arena = get_arena(getattr(args, "arena", None))
+    _slot_name = m.ops[0].slot
+    _arena_kl = _arena.kl_floor_for(_slot_name)
+    _slot_kl = _get_slot(_slot_name).kl_threshold
+    _kl_threshold = (None if args.kl_advisory
+                     else _arena_kl if _arena_kl is not None
+                     else _slot_kl if _slot_kl is not None
+                     else args.kl_threshold)
+    if _arena.name != "default":
+        print(f"  (arena {_arena.name!r}: model={_arena.model_path or 'any'}, sglang={_arena.sglang_version})")
     if args.samples < 100 and not args.kl_advisory:
         print(f"  [note] --samples {args.samples} is small for the accuracy gate "
               "(~12% std at n=12); KL is the primary gate, use ~100-200 for a real accuracy floor.")
@@ -332,7 +368,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         candidate_attention_backend=args.candidate_attention_backend,
         candidate_moe_runner_backend=args.candidate_moe_runner_backend,
         candidate_disable_custom_all_reduce=args.candidate_disable_custom_all_reduce,
-        extra_engine_kwargs=_json_obj(args.engine_kwargs_json),
+        extra_engine_kwargs={**_arena.engine_kwargs, **_json_obj(args.engine_kwargs_json)},
         candidate_extra_engine_kwargs=_json_obj(args.candidate_engine_kwargs_json),
     )
     names = [b.strip() for b in args.benchmarks.split(",") if b.strip()]
@@ -382,15 +418,14 @@ def cmd_bench(args: argparse.Namespace) -> int:
         from optima.bundle_hash import content_hash
         from optima.commit_reveal import Ledger
 
-        from optima.compat import PINNED_SGLANG
-
         ch = content_hash(args.bundle)
         led = Ledger.load(args.ledger)
         led.record_score(args.hotkey, ch, args.round, report.score, report.kl.mean_kl,
-                         report.passed_quality, sglang_version=PINNED_SGLANG, slot=m.ops[0].slot)
+                         report.passed_quality, sglang_version=_arena.sglang_version,
+                         slot=_slot_name, arena=_arena.name)
         led.save(args.ledger)
         print(f"recorded -> {args.ledger} (hotkey={args.hotkey}, round={args.round}, "
-              f"slot={m.ops[0].slot}, sglang={PINNED_SGLANG})")
+              f"arena={_arena.name}, slot={_slot_name}, sglang={_arena.sglang_version})")
     return 0 if report.passed_quality else 3
 
 
@@ -459,14 +494,21 @@ def cmd_ledger(args: argparse.Namespace) -> int:
 
 
 def cmd_settle(args: argparse.Namespace) -> int:
+    from optima.arenas import get_arena
     from optima.commit_reveal import Ledger
-    from optima.compat import PINNED_SGLANG
 
+    # --arena scopes the settle to one arena's scores (cross-model speedups aren't
+    # comparable) and supplies the current pin for the stale-champion check. Omit it to
+    # settle all scores against the default pin (pre-arena behavior).
+    arena_name = getattr(args, "arena", None)
+    arena = get_arena(arena_name)
+    cur_ver = arena.sglang_version
     led = Ledger.load(args.ledger)
     if getattr(args, "per_slot", False):
-        res = led.settle_per_slot(args.round, margin=args.margin, current_sglang_version=PINNED_SGLANG)
+        res = led.settle_per_slot(args.round, margin=args.margin,
+                                  current_sglang_version=cur_ver, arena=arena_name)
         led.save(args.ledger)
-        print("per-slot championships (emission split across slots):")
+        print(f"per-slot championships (arena {arena.name!r}; emission split across slots):")
         for slot, champ in sorted(res.champions.items()):
             changed = " (NEW)" if res.title_changes.get(slot) else ""
             stale = "  ⚠ STALE pin — re-baseline" if slot in res.stale_slots else ""
@@ -475,13 +517,13 @@ def cmd_settle(args: argparse.Namespace) -> int:
             print(f"rejected copies: {', '.join(res.rejected_copies)}")
         print(f"weights: {res.weights}")
         return 0
-    res = led.settle(args.round, margin=args.margin, current_sglang_version=PINNED_SGLANG)
+    res = led.settle(args.round, margin=args.margin, current_sglang_version=cur_ver, arena=arena_name)
     led.save(args.ledger)
     print(f"title_changed={res.title_changed} challenger_score={res.challenger_score:.3f}")
     if res.champion:
         print(f"champion: {res.champion.hotkey} score={res.champion.score:.3f}")
     if res.champion_stale:
-        print(f"  ⚠ champion was crowned under a DIFFERENT sglang pin than {PINNED_SGLANG}; "
+        print(f"  ⚠ champion was crowned under a DIFFERENT sglang pin than {cur_ver}; "
               "re-baseline it (re-evaluate the champion bundle on the current pin).")
     if res.rejected_copies:
         print(f"rejected copies: {', '.join(res.rejected_copies)}")
@@ -496,7 +538,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("slots", help="list the op-slot ABI")
     sp.set_defaults(func=cmd_slots)
 
+    sp = sub.add_parser("arenas", help="list the model arenas (per-model sglang pin + KL floors)")
+    sp.set_defaults(func=cmd_arenas)
+
     sp = sub.add_parser("compat", help="check our sglang integration points survived an upgrade")
+    sp.add_argument("--arena", default=None,
+                    help="check the seams for this arena's pin + adapter subset (optima/arenas.py); "
+                         "default = the default arena")
     sp.set_defaults(func=cmd_compat)
 
     sp = sub.add_parser("chain-compat",
@@ -579,6 +627,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="run the candidate in a no-egress network namespace (auto-on with --framework-mode); needs root")
     sp.add_argument("--allow-unsafe-no-isolation", action="store_true",
                     help="DEV ONLY: continue if candidate no-egress isolation is unavailable")
+    sp.add_argument("--arena", default=None,
+                    help="score in this model arena (optima/arenas.py): its sglang pin, KL floors, "
+                         "and engine kwargs. Default = the default arena (pre-arena behavior)")
     sp.set_defaults(func=cmd_evaluate)
 
     sp = sub.add_parser("bench",
@@ -640,6 +691,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--ledger", default=None)
     sp.add_argument("--hotkey", default=None)
     sp.add_argument("--round", type=int, default=0)
+    sp.add_argument("--arena", default=None,
+                    help="score in this model arena (optima/arenas.py): its sglang pin, KL floors, "
+                         "and engine kwargs. Default = the default arena (pre-arena behavior)")
     sp.set_defaults(func=cmd_bench)
 
     # ---- commit-reveal / scoring ledger ----
@@ -674,6 +728,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--per-slot", action="store_true",
                     help="per-slot championships (one champion per slot, emission split) — pays "
                          "specialists, vs the winner-take-all default")
+    sp.add_argument("--arena", default=None,
+                    help="settle only this arena's scores against its pin (cross-model scores aren't "
+                         "comparable). Default = all scores vs the default pin (pre-arena behavior)")
     sp.set_defaults(func=cmd_settle)
 
     return p

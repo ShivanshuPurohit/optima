@@ -17,10 +17,15 @@ from __future__ import annotations
 import dataclasses
 import inspect
 from dataclasses import dataclass
+from typing import Optional
 
-# The sglang version scored against. Bump DELIBERATELY and in a coordinated way —
-# see docs/SGLANG_TRACKING.md. All validators must run the same version (consensus).
-PINNED_SGLANG = "0.5.12.post1"
+from optima.arenas import DEFAULT_ARENA, Arena
+
+# The sglang version scored against, for the DEFAULT arena. Bump DELIBERATELY and in a
+# coordinated way — see docs/SGLANG_TRACKING.md. All validators must run the same version
+# for a given arena (per-arena consensus). Aliased to the default arena's pin so existing
+# importers keep working; a non-default arena carries its own version (see optima/arenas.py).
+PINNED_SGLANG = DEFAULT_ARENA.sglang_version
 
 
 @dataclass
@@ -30,7 +35,14 @@ class Check:
     detail: str = ""
 
 
-def run_checks() -> list[Check]:
+def run_checks(arena: Optional[Arena] = None) -> list[Check]:
+    """Canary the seams against the INSTALLED sglang for an arena (default: DEFAULT_ARENA).
+
+    For a non-default arena, the pinned version is the arena's, and only the seam adapters
+    that apply to that arena are required (a model that never uses MoE/collective isn't
+    blocked when those seams break on its image). Run inside that arena's docker image.
+    """
+    arena = arena or DEFAULT_ARENA
     checks: list[Check] = []
 
     def add(name: str, ok: bool, detail: str = "") -> None:
@@ -44,9 +56,9 @@ def run_checks() -> list[Check]:
 
     ver = getattr(sglang, "__version__", "?")
     add(
-        f"sglang installed (pinned {PINNED_SGLANG})",
+        f"arena {arena.name!r}: sglang pinned {arena.sglang_version}",
         True,
-        f"found {ver}" + ("" if ver == PINNED_SGLANG else "  <-- DIFFERS from pin"),
+        f"found {ver}" + ("" if ver == arena.sglang_version else "  <-- DIFFERS from arena pin"),
     )
 
     # Table-driven baseline: every adapter in the single seam table (optima/seams.py)
@@ -58,6 +70,8 @@ def run_checks() -> list[Check]:
     from optima.seams import SEAM_ADAPTERS
 
     for adapter in SEAM_ADAPTERS:
+        if not arena.applies_seam(adapter.name):
+            continue  # this seam is out of scope for this arena's model
         cls_name, _, meth = adapter.chokepoint.partition(".")
         try:
             mod = importlib.import_module(adapter.target_module)

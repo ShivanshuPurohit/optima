@@ -137,6 +137,7 @@ caught a *subtle* real drift a per-op check missed.
 optima/
   slots.py                  # the slot ABI: SlotSpec catalog (7 slots; kind = op|block|collective)
   seams.py                  # single source of truth for the seam adapters (bootstrap/activate/compat derive from it)
+  arenas.py                 # per-model runtime/calibration map: {sglang version, image, seam subset, KL floors}
   eval/scoring.py           # noise-robust speedup verdict (bookended A/B, noise-derived margin, no-decision)
   copy_fingerprint.py       # reformat-invariant near-copy fingerprint (AST-normalized)
   manifest.py               # bundle manifest parse + path-safety
@@ -313,6 +314,31 @@ can't hard-code the verify shapes), `ignore_eos` so both sides emit identical to
 and the throughput numerator is a driver-known fixed budget (not a scheduler-reported
 count), a `max_running_requests` knob to score at a serving-realistic batch, and a
 **stale-champion** flag at settle when the `PINNED_SGLANG` differs (re-baseline on a bump).
+
+## Arenas: trying a new model
+
+Different models ship in different sglang images/versions (gpt-oss on the pin, DeepSeek-V4
+on `…:deepseek-v4-blackwell`, a launch-window model on a nightly). An **arena**
+(`optima/arenas.py`) captures everything model-specific — `{model_path, sglang_version,
+docker_image, seam-adapter subset, per-model KL floors, engine kwargs}` — so **"try a new
+model" is a config row, not a manual sglang checkout + a hand-edited constant**:
+
+```python
+MINIMAX_M3 = Arena(name="minimax-m3", model_path="MiniMaxAI/MiniMax-M3",
+                   sglang_version="0.5.13", docker_image="lmsysorg/sglang:<m3-tag>",
+                   seam_adapters=("attention", "moe", "collective"),
+                   kl_floors={"attention.decode": 0.04}, engine_kwargs={"tp_size": 4})
+```
+
+Then `optima compat --arena minimax-m3` (checks that arena's pin + seam subset) and
+`optima {evaluate,bench,settle} --arena minimax-m3`. The KL gate resolves **arena floor >
+slot default > CLI**; the arena supplies the model's base engine kwargs; scores are stamped
+with their arena and only compare within one. Only **one arena is competed at a time**
+(consensus = one runtime fleet-wide per season) — the registry makes "what's pinned"
+declarative and lets you stage the next rotation target without disturbing the validated
+path. `DEFAULT_ARENA` equals pre-arena behavior, and `PINNED_SGLANG` aliases its version, so
+this is additive. `optima arenas` lists them. Arenas live **below the SlotSpec waist** — the
+four invariants and the miner contract never move.
 
 ## Security model
 

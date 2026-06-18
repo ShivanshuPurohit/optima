@@ -26,10 +26,16 @@ pick their base," and even "let each validator pick," are both ruled out by this
 it isn't a fairness nicety, it's consensus.
 
 The sglang version is therefore a **coordinated, pinned subnet parameter**, bumped
-deliberately per "season," not "latest on each box." The single source of truth is
-`PINNED_SGLANG` in [../optima/compat.py](../optima/compat.py) (currently
-`0.5.12.post1`, CUDA 13 — validated end-to-end on an H100: all seams intact, the
-broken-bundle gate FAILs, faithful kernels PASS).
+deliberately per "season," not "latest on each box." The pin is now **per-arena**
+(`optima/arenas.py`): each model arena carries its own `sglang_version` + image, and
+`PINNED_SGLANG` in [../optima/compat.py](../optima/compat.py) aliases the **default
+arena's** version (currently `0.5.12.post1`, CUDA 13 — validated end-to-end on an H100:
+all seams intact, the broken-bundle gate FAILs, faithful kernels PASS). Consensus is
+**per-arena**: validators agree on the version FOR THE MODEL being competed, and only one
+arena is competed at a time — so a new model (different sglang/image) is a NEW arena row,
+not a global bump that re-baselines everything. `optima compat --arena X` canaries that
+arena's pin + its seam-adapter subset; run it inside that arena's docker image. Trying a
+launch-window model therefore never endangers the validated default arena.
 
 ## What's actually coupled: the score, not the kernel
 

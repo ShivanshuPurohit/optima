@@ -111,6 +111,7 @@ class Score:
     passed: bool
     sglang_version: str = ""  # the pin this speedup was measured against (re-baseline key)
     slot: str = ""  # the slot this submission competes in (for per-slot championships)
+    arena: str = ""  # the model/arena this was scored in — speedups only compare within an arena
 
 
 @dataclass
@@ -297,9 +298,9 @@ class Ledger:
 
     def record_score(self, hotkey: str, content_hash: str, round_id: int,
                      score: float, kl_mean: float, passed: bool, sglang_version: str = "",
-                     slot: str = "") -> None:
+                     slot: str = "", arena: str = "") -> None:
         self.scores.append(Score(hotkey, content_hash, round_id, score, kl_mean, passed,
-                                 sglang_version, slot))
+                                 sglang_version, slot, arena))
 
     # ---- full eval records (audit trail + dedup; the rich superset of a Score) ----
 
@@ -326,7 +327,7 @@ class Ledger:
         return False
 
     def settle(self, round_id: int, margin: float = 0.02,
-               current_sglang_version: str = "") -> SettleResult:
+               current_sglang_version: str = "", arena: Optional[str] = None) -> SettleResult:
         """Apply king-of-the-hill: a challenger takes the title only if it beats the
         champion by ``margin``. Emission goes to the champion (winner-take-all baseline).
         Copies and non-improvers earn nothing.
@@ -348,6 +349,8 @@ class Ledger:
         for s in self.scores:
             if s.round_id != round_id or not s.passed:
                 continue
+            if arena is not None and s.arena != arena:
+                continue  # only compare within the same arena (cross-model scores aren't comparable)
             if not self._is_original(s.hotkey, s.content_hash, round_id):
                 rejected_copies.append(s.hotkey)
                 continue
@@ -390,7 +393,7 @@ class Ledger:
         )
 
     def settle_per_slot(self, round_id: int, margin: float = 0.02,
-                        current_sglang_version: str = "") -> PerSlotSettleResult:
+                        current_sglang_version: str = "", arena: Optional[str] = None) -> PerSlotSettleResult:
         """Per-slot king-of-the-hill: a champion PER slot, emission split equally across
         the slots that have a champion. This pays a specialist who owns ONE slot, instead
         of giving 100% to the single best end-to-end bundle (winner-take-all starves
@@ -403,6 +406,8 @@ class Ledger:
         for s in self.scores:
             if s.round_id != round_id or not s.passed:
                 continue
+            if arena is not None and s.arena != arena:
+                continue  # only compare within the same arena
             if not self._is_original(s.hotkey, s.content_hash, round_id):
                 rejected_copies.append(s.hotkey)
                 continue

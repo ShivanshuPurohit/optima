@@ -123,10 +123,13 @@ class SlotSpec:
     #     handing it the process group; it fills `out` with the REDUCED result.
     collective_partial: Optional[Callable] = None
     invoke_collective: Optional[Callable] = None
-    # Per-slot end-to-end KL gate, calibrated to THIS slot's intrinsic noise floor (the
-    # generic 5e-3 default is tuned for elementwise ops; attention sits ~6e-3 vs flash's
-    # reordered softmax, so a flat 5e-3 false-fails a faithful attention kernel — README
-    # calibration finding 6). None -> use the eval's generic threshold.
+    # Per-slot end-to-end KL gate DEFAULT, calibrated to this slot's intrinsic (model-
+    # agnostic) noise floor: the generic 5e-3 is tuned for elementwise ops; attention sits
+    # ~6e-3 vs flash's reordered softmax, so a flat 5e-3 false-fails a faithful attention
+    # kernel (README calibration finding 6). This is a FALLBACK — a per-MODEL `Arena`
+    # (optima/arenas.py) overrides it via `kl_floors[slot]`, because the floor is also
+    # model-specific (gpt-oss 3.9e-4 vs det/non-det ~30x). Resolution: arena floor > this
+    # slot default > the CLI --kl-threshold. None -> no slot default (use arena/CLI).
     kl_threshold: Optional[float] = None
 
     def tolerance_for(self, dtype: torch.dtype) -> Tolerance:

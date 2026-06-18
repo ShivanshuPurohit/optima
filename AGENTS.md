@@ -72,6 +72,15 @@ This repo is the **validator harness** (the referee), plus example miner bundles
   `optima settle --per-slot` = a champion per slot, emission split (pays specialists); a champion
   on a different `PINNED_SGLANG` is flagged stale (re-baseline). `optima verify` loads + runs the
   kernel **out-of-process** so the CLI never imports miner code (full netns isolation is still TODO).
+- **Arenas = the per-model runtime/calibration map** (`optima/arenas.py`). Different models ship
+  in different sglang images/versions, so an `Arena` holds `{model_path, sglang_version, docker_image,
+  seam_adapters subset, kl_floors, engine_kwargs}`. **"Try a new model" = add an `Arena` row + `optima
+  compat --arena X`**, not a manual sglang checkout + constant edit. Pass `--arena` to evaluate/bench/
+  settle. The KL gate resolves arena floor > slot default (`SlotSpec.kl_threshold`) > CLI. Only ONE
+  arena is competed at a time (consensus = one runtime fleet-wide per season); the registry just makes
+  "what's pinned" declarative + lets you stage the next rotation target. `PINNED_SGLANG` now aliases
+  `DEFAULT_ARENA.sglang_version` (pre-arena behavior unchanged). Scores are stamped with their arena
+  and only compare within one (cross-model speedups aren't comparable). Arenas live BELOW the waist.
 - **No kernel has beaten sglang.** The mechanism is validated to fire correctly on real
   models (a faithful kernel reproduces the model; a broken one is caught by the gate), but
   every example kernel is a correctness demo — the faithful ones are *slower* than sglang's
