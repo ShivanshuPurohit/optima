@@ -76,6 +76,18 @@ def _compare(
         return False, float("inf"), float("inf"), 0.0, f"shape mismatch {tuple(actual.shape)} vs {tuple(expected.shape)}", "ratio"
     a = actual.float()
     e = expected.float()
+    if correctness.mode == "topk_overlap":
+        # Selection metric: only WHICH top-k are picked matters (not the score values), so
+        # this runs BEFORE the finite guard (masked-out positions are legitimately -inf). A
+        # buggy kernel emitting NaN -> ranked last (nan_to_num), so it just loses overlap.
+        k = correctness.top_k
+        ta = torch.nan_to_num(a, nan=float("-inf")).topk(k, dim=-1).indices
+        te = e.topk(k, dim=-1).indices
+        overlap = (ta.unsqueeze(-1) == te.unsqueeze(-2)).any(dim=-1).float().mean(dim=-1)
+        score = float(overlap.mean())
+        passed = score >= correctness.min_overlap
+        detail = "" if passed else f"topk_overlap {score:.4f} < min_overlap {correctness.min_overlap}"
+        return passed, 0.0, 0.0, score, detail, "overlap"
     if not torch.isfinite(a).all():
         return False, float("inf"), float("inf"), 0.0, "actual has non-finite values", "ratio"
     abs_err = (a - e).abs()
@@ -266,6 +278,8 @@ def format_verify(result: VerifyResult) -> str:
         status = "ok " if r.passed else "FAIL"
         if r.metric == "cosine":
             score = f" cos={r.pass_ratio:.5f}"
+        elif r.metric == "overlap":
+            score = f" overlap={r.pass_ratio:.4f}"
         else:
             score = "" if r.pass_ratio >= 1.0 else f" ratio={r.pass_ratio:.4f}"
         lines.append(
