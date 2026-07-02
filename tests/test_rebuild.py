@@ -89,6 +89,39 @@ def test_repo_python_missing_patcher_fails_closed(tmp_path, monkeypatch):
         apply_rebuild_plan(bundle)
 
 
+def test_repo_python_rejects_sibling_dir_that_prefixes_patchers(tmp_path, monkeypatch):
+    # A sibling dir whose name STRING-prefixes "optima/patchers" (optima/patchers_evil)
+    # takes the repo-relative branch, so containment (not the branch) must reject it.
+    repo = _fake_repo(tmp_path)
+    (repo / "optima" / "patchers_evil").mkdir()
+    (repo / "optima" / "patchers_evil" / "x.py").write_text(
+        f"open({str(tmp_path / 'evil_ran')!r}, 'w').close()\n"
+    )
+    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
+    bundle = _bundle(tmp_path, {"steps": [{"type": "repo_python", "path": "optima/patchers_evil/x.py"}]})
+    with pytest.raises(RebuildError, match="escape|not found"):
+        apply_rebuild_plan(bundle)
+    assert not (tmp_path / "evil_ran").exists()
+
+
+def test_repo_python_rejects_intermediate_symlinked_dir(tmp_path, monkeypatch):
+    # A symlinked SUBDIR under patchers/ (not the leaf) that points outside the reviewed
+    # set: the leaf isn't a symlink, so only resolve()+containment catches the escape.
+    repo = _fake_repo(tmp_path)
+    outside = tmp_path / "outside_dir"
+    outside.mkdir()
+    (outside / "x.py").write_text(f"open({str(tmp_path / 'outside_ran')!r}, 'w').close()\n")
+    try:
+        (repo / "optima" / "patchers" / "sub").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("no symlink support")
+    monkeypatch.setenv("OPTIMA_REPO_ROOT", str(repo))
+    bundle = _bundle(tmp_path, {"steps": [{"type": "repo_python", "path": "sub/x.py"}]})
+    with pytest.raises(RebuildError, match="escape"):
+        apply_rebuild_plan(bundle)
+    assert not (tmp_path / "outside_ran").exists()
+
+
 def test_repo_python_rejects_symlinked_patcher(tmp_path, monkeypatch):
     # A symlink inside the patcher dir could re-point at an unreviewed target.
     repo = _fake_repo(tmp_path)
